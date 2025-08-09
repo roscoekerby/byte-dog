@@ -440,7 +440,7 @@ class ByteDogApp:
         title_frame.pack(fill='x', pady=(0, 10))
 
         title_label = ttk.Label(title_frame, text="ByteDog System Monitor",
-                                font=('Arial', 10, 'bold'))
+            font=('Arial', 10, 'bold'))
         title_label.pack(side='left')
 
         # View toggle button
@@ -538,6 +538,7 @@ class ByteDogApp:
         """Create menu bar"""
         menubar = tk.Menu(self.root, bg=self.colors['button'], fg=self.colors['fg'])
         self.root.config(menu=menubar)
+        self.menubar = menubar  # keep a handle so we can reattach after minimal
 
         # File menu
         file_menu = tk.Menu(menubar, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
@@ -582,6 +583,7 @@ class ByteDogApp:
 
         # Hide all frames first
         for widget in self.root.winfo_children():
+            # Do not pack_forget menu; it's not a child widget, so safe regardless
             widget.pack_forget()
 
         if mode == "minimal":
@@ -589,14 +591,14 @@ class ByteDogApp:
             self.minimal_frame.pack(fill='both', expand=True)
             self.root.update_idletasks()
 
-            # Get the actual size needed and resize window
+            # Get the actual size needed and resize window (keeps it tiny on each toggle)
             req_width = self.minimal_frame.winfo_reqwidth()
             req_height = self.minimal_frame.winfo_reqheight()
             self.root.geometry(f"{req_width}x{req_height}")
 
-            # Remove window decorations for true minimal look
+            # Remove window decorations and hide the menubar entirely
             self.root.overrideredirect(True)
-            self.main_frame.config(padding="0")
+            self.root.config(menu="")  # hide menubar in minimal
 
         elif mode == "compact":
             # Compact mode - essential info with window decorations
@@ -605,6 +607,8 @@ class ByteDogApp:
             self.root.geometry("340x320")
             if hasattr(self, 'toggle_btn'):
                 self.toggle_btn.config(text="▼")
+            if hasattr(self, 'menubar'):
+                self.root.config(menu=self.menubar)  # restore menubar
 
         else:  # detailed
             # Detailed mode - all information
@@ -613,6 +617,8 @@ class ByteDogApp:
             self.root.geometry("450x700")
             if hasattr(self, 'detailed_toggle_btn'):
                 self.detailed_toggle_btn.config(text="▲")
+            if hasattr(self, 'menubar'):
+                self.root.config(menu=self.menubar)  # restore menubar
 
     def create_metric_card(self, parent, title, value, unit):
         """Create a metric display card"""
@@ -634,8 +640,7 @@ class ByteDogApp:
     def update_metric_card(self, card, value, unit="%"):
         """Update a metric card's value"""
         if isinstance(value, (int, float)):
-            color = self.colors['success'] if value < 50 else self.colors['warning'] if value < 80 else self.colors[
-                'error']
+            color = self.colors['success'] if value < 50 else self.colors['warning'] if value < 80 else self.colors['error']
             card.value_label.config(text=f"{value:.0f}{unit}", fg=color)
 
     def create_simple_process_list(self, parent):
@@ -1031,8 +1036,7 @@ class ByteDogApp:
                     for i, label in enumerate(self.core_labels):
                         if i < len(cores):
                             usage = cores[i]
-                            color = self.colors['success'] if usage < 50 else self.colors['warning'] if usage < 80 else \
-                            self.colors['error']
+                            color = self.colors['success'] if usage < 50 else self.colors['warning'] if usage < 80 else self.colors['error']
                             label.config(text=f"Core {i}: {usage:.1f}%", fg=color)
 
                 # Update process list if visible
@@ -1454,4 +1458,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
