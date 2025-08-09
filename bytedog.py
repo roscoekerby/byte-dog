@@ -3,6 +3,7 @@
 ByteDog - Lightweight System Resource Monitor
 A minimal-resource system monitor following the Dog family design principles
 Complete version with NetDog-style view toggling
+FIXED: Arrow visibility in minimal view
 """
 
 import tkinter as tk
@@ -395,7 +396,7 @@ class ByteDogApp:
         self.root.bind('<Button-3>', self.show_context_menu)
 
     def create_minimal_view(self):
-        """Create the minimal League of Legends style view"""
+        """Create the minimal League of Legends style view - FIXED ARROW VISIBILITY"""
         self.minimal_frame = tk.Frame(self.root, bg='black', padx=8, pady=4)
 
         # Single frame to hold all elements in one line
@@ -415,18 +416,35 @@ class ByteDogApp:
                                               font=('Arial', 10, 'bold'))
         self.minimal_metrics_label.pack(side=tk.LEFT)
 
-        # Triangle button to expand/cycle view (right side)
+        # FIXED: More visible arrow button with better styling
         self.minimal_expand_btn = tk.Label(
             content_frame,
-            text="▸",  # Triangle pointing right
-            font=("Arial", 12, "bold"),
-            fg="white",
+            text="►",  # Using solid right-pointing triangle
+            font=("Arial", 14, "bold"),  # Larger font
+            fg="#00ff00",  # Bright green color for visibility
             bg="black",
             cursor="hand2",
-            padx=6, pady=0
+            padx=8, pady=2,
+            relief="raised",  # Add some visual depth
+            bd=1  # Border for better visibility
         )
-        self.minimal_expand_btn.pack(side=tk.LEFT, padx=(4, 0))
-        self.minimal_expand_btn.bind("<Button-1>", lambda e: self.cycle_view_mode())
+        self.minimal_expand_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        # FIXED: Add hover effects to make the button more interactive
+        def on_enter(e):
+            self.minimal_expand_btn.config(fg="#ffff00", relief="raised", bd=2)  # Yellow on hover
+
+        def on_leave(e):
+            self.minimal_expand_btn.config(fg="#00ff00", relief="raised", bd=1)  # Back to green
+
+        def on_click(e):
+            self.minimal_expand_btn.config(relief="sunken")  # Visual feedback
+            self.root.after(100, lambda: self.minimal_expand_btn.config(relief="raised"))
+            self.cycle_view_mode()
+
+        self.minimal_expand_btn.bind("<Enter>", on_enter)
+        self.minimal_expand_btn.bind("<Leave>", on_leave)
+        self.minimal_expand_btn.bind("<Button-1>", on_click)
 
     def create_compact_view(self):
         """Create the compact view with essential metrics"""
@@ -440,7 +458,7 @@ class ByteDogApp:
         title_frame.pack(fill='x', pady=(0, 10))
 
         title_label = ttk.Label(title_frame, text="ByteDog System Monitor",
-            font=('Arial', 10, 'bold'))
+                                font=('Arial', 10, 'bold'))
         title_label.pack(side='left')
 
         # View toggle button
@@ -640,7 +658,8 @@ class ByteDogApp:
     def update_metric_card(self, card, value, unit="%"):
         """Update a metric card's value"""
         if isinstance(value, (int, float)):
-            color = self.colors['success'] if value < 50 else self.colors['warning'] if value < 80 else self.colors['error']
+            color = self.colors['success'] if value < 50 else self.colors['warning'] if value < 80 else self.colors[
+                'error']
             card.value_label.config(text=f"{value:.0f}{unit}", fg=color)
 
     def create_simple_process_list(self, parent):
@@ -1036,7 +1055,8 @@ class ByteDogApp:
                     for i, label in enumerate(self.core_labels):
                         if i < len(cores):
                             usage = cores[i]
-                            color = self.colors['success'] if usage < 50 else self.colors['warning'] if usage < 80 else self.colors['error']
+                            color = self.colors['success'] if usage < 50 else self.colors['warning'] if usage < 80 else \
+                            self.colors['error']
                             label.config(text=f"Core {i}: {usage:.1f}%", fg=color)
 
                 # Update process list if visible
