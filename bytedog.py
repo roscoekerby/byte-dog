@@ -2,6 +2,7 @@
 """
 ByteDog - Lightweight System Resource Monitor
 A minimal-resource system monitor following the Dog family design principles
+Complete version with NetDog-style view toggling
 """
 
 import tkinter as tk
@@ -12,7 +13,7 @@ import time
 import platform
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import deque
 import subprocess
 import sys
@@ -25,6 +26,21 @@ try:
     GPU_AVAILABLE = True
 except ImportError:
     GPU_AVAILABLE = False
+
+# Hide console window on Windows when running as EXE
+if platform.system() == 'Windows' and getattr(sys, 'frozen', False):
+    import ctypes
+
+    ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
+
+
+def resource_path(name: str) -> str:
+    """
+    Resolve bundled resource paths (works for PyInstaller and normal runs).
+    """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, name)
+    return os.path.join(os.path.dirname(__file__), name)
 
 
 class SystemMonitor:
@@ -101,6 +117,7 @@ class SystemMonitor:
                     'load': gpu.load * 100,
                     'memory_used': gpu.memoryUsed,
                     'memory_total': gpu.memoryTotal,
+                    'memory_percent': (gpu.memoryUsed / gpu.memoryTotal) * 100 if gpu.memoryTotal > 0 else 0,
                     'temperature': gpu.temperature
                 }
         except:
@@ -179,6 +196,13 @@ class MinimalView(tk.Toplevel):
         self.attributes('-topmost', True)
         self.overrideredirect(True)
 
+        # Window icon for Windows
+        if platform.system() == "Windows":
+            try:
+                self.iconbitmap(resource_path("ByteDog_256.ico"))
+            except Exception:
+                pass
+
         self.configure(bg='#1e1e1e')
 
         self.setup_ui()
@@ -248,7 +272,13 @@ class ByteDogApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("ByteDog - System Resource Monitor 🐕")
-        self.root.geometry("900x600")
+
+        # Window icon for Windows
+        if platform.system() == "Windows":
+            try:
+                self.root.iconbitmap(resource_path("ByteDog_256.ico"))
+            except Exception:
+                pass
 
         self.monitor = SystemMonitor()
         self.process_manager = ProcessManager()
@@ -256,7 +286,7 @@ class ByteDogApp:
         # Initialize CPU percent to prevent blocking
         psutil.cpu_percent(interval=None)
 
-        self.current_view = 'compact'
+        self.view_mode = tk.StringVar(value="minimal")  # Start with minimal like NetDog
         self.minimal_window = None
         self.selected_process = None
         self.sort_column = 'memory_percent'
@@ -277,10 +307,54 @@ class ByteDogApp:
             'error': '#f44336'
         }
 
+        # Dragging variables
+        self.drag_start_x = 0
+        self.drag_start_y = 0
+
+        self.setup_window()
         self.setup_styles()
         self.setup_ui()
         self.start_monitoring()
         self.process_queue()
+
+    def setup_window(self):
+        """Configure the main window"""
+        self.root.attributes('-topmost', True)
+        self.root.attributes('-alpha', 0.9)
+
+        # Position in top-right corner
+        self.root.update_idletasks()
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = screen_width - 200 - 20  # Start smaller for minimal view
+        y = 50
+        self.root.geometry(f"200x80+{x}+{y}")
+
+        # Make window draggable
+        self.root.bind('<Button-1>', self.start_drag)
+        self.root.bind('<B1-Motion>', self.on_drag)
+
+        # Bind dragging to all child widgets
+        self.root.bind_all('<Button-1>', self.start_drag)
+        self.root.bind_all('<B1-Motion>', self.on_drag)
+
+    def start_drag(self, event):
+        """Start dragging the window"""
+        # Don't drag if clicking on expand button
+        if hasattr(self, 'minimal_expand_btn') and event.widget == self.minimal_expand_btn:
+            return
+        if hasattr(self, 'toggle_btn') and event.widget == self.toggle_btn:
+            return
+        if hasattr(self, 'detailed_toggle_btn') and event.widget == self.detailed_toggle_btn:
+            return
+        self.drag_start_x = event.x
+        self.drag_start_y = event.y
+
+    def on_drag(self, event):
+        """Handle window dragging"""
+        x = self.root.winfo_pointerx() - self.drag_start_x
+        y = self.root.winfo_pointery() - self.drag_start_y
+        self.root.geometry(f"+{x}+{y}")
 
     def setup_styles(self):
         """Configure ttk styles for dark theme"""
@@ -304,84 +378,90 @@ class ByteDogApp:
         """Setup main UI"""
         self.root.configure(bg=self.colors['bg'])
 
+        # Main content area
+        self.main_frame = ttk.Frame(self.root)
+        self.main_frame.pack(fill='both', expand=True)
+
+        # Create all view frames
+        self.create_minimal_view()
+        self.create_compact_view()
+        self.create_detailed_view()
+
+        # Set initial view
+        self.update_view_mode()
+
+        # Context menu
+        self.create_context_menu()
+        self.root.bind('<Button-3>', self.show_context_menu)
+
+    def create_minimal_view(self):
+        """Create the minimal League of Legends style view"""
+        self.minimal_frame = tk.Frame(self.root, bg='black', padx=8, pady=4)
+
+        # Single frame to hold all elements in one line
+        content_frame = tk.Frame(self.minimal_frame, bg='black')
+        content_frame.pack()
+
+        # Status dot (left side)
+        self.minimal_dot_canvas = tk.Canvas(content_frame, width=12, height=12,
+                                            bg='black', highlightthickness=0)
+        self.minimal_dot_canvas.pack(side=tk.LEFT, padx=(0, 6))
+        self.minimal_dot = self.minimal_dot_canvas.create_oval(2, 2, 10, 10,
+                                                               fill='gray', outline='white', width=1)
+
+        # System metrics text (middle)
+        self.minimal_metrics_label = tk.Label(content_frame, text="CPU: -- | RAM: --",
+                                              fg='white', bg='black',
+                                              font=('Arial', 10, 'bold'))
+        self.minimal_metrics_label.pack(side=tk.LEFT)
+
+        # Triangle button to expand/cycle view (right side)
+        self.minimal_expand_btn = tk.Label(
+            content_frame,
+            text="▸",  # Triangle pointing right
+            font=("Arial", 12, "bold"),
+            fg="white",
+            bg="black",
+            cursor="hand2",
+            padx=6, pady=0
+        )
+        self.minimal_expand_btn.pack(side=tk.LEFT, padx=(4, 0))
+        self.minimal_expand_btn.bind("<Button-1>", lambda e: self.cycle_view_mode())
+
+    def create_compact_view(self):
+        """Create the compact view with essential metrics"""
+        self.compact_frame = ttk.Frame(self.root, padding="10")
+
         # Menu bar
         self.create_menu()
 
-        # Top toolbar
-        self.create_toolbar()
+        # Title bar
+        title_frame = ttk.Frame(self.compact_frame)
+        title_frame.pack(fill='x', pady=(0, 10))
 
-        # Main content area
-        self.main_frame = ttk.Frame(self.root)
-        self.main_frame.pack(fill='both', expand=True, padx=10, pady=5)
+        title_label = ttk.Label(title_frame, text="ByteDog System Monitor",
+                                font=('Arial', 10, 'bold'))
+        title_label.pack(side='left')
 
-        # Show compact view by default
-        self.show_compact_view()
+        # View toggle button
+        self.toggle_btn = ttk.Button(title_frame, text="▼", width=3,
+                                     command=self.cycle_view_mode)
+        self.toggle_btn.pack(side='right')
 
-    def create_menu(self):
-        """Create menu bar"""
-        menubar = tk.Menu(self.root, bg=self.colors['button'], fg=self.colors['fg'])
-        self.root.config(menu=menubar)
+        # Status indicator
+        status_frame = ttk.Frame(self.compact_frame)
+        status_frame.pack(fill='x', pady=(0, 10))
 
-        # File menu
-        file_menu = tk.Menu(menubar, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
-        menubar.add_cascade(label="File", menu=file_menu)
-        file_menu.add_command(label="Export Data...", command=self.export_data)
-        file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.quit)
+        self.status_canvas = tk.Canvas(status_frame, width=20, height=20)
+        self.status_canvas.pack(side=tk.LEFT)
+        self.status_indicator = self.status_canvas.create_oval(2, 2, 18, 18,
+                                                               fill='gray', outline='')
 
-        # View menu
-        view_menu = tk.Menu(menubar, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
-        menubar.add_cascade(label="View", menu=view_menu)
-        view_menu.add_command(label="Minimal", command=self.show_minimal_view)
-        view_menu.add_command(label="Compact", command=self.show_compact_view)
-        view_menu.add_command(label="Detailed", command=self.show_detailed_view)
-
-        # Tools menu
-        tools_menu = tk.Menu(menubar, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
-        menubar.add_cascade(label="Tools", menu=tools_menu)
-        tools_menu.add_command(label="Settings", command=self.show_settings)
-        tools_menu.add_command(label="Performance Report", command=self.generate_report)
-
-        # Help menu
-        help_menu = tk.Menu(menubar, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
-        menubar.add_cascade(label="Help", menu=help_menu)
-        help_menu.add_command(label="About", command=self.show_about)
-
-    def create_toolbar(self):
-        """Create toolbar with view switcher"""
-        toolbar = tk.Frame(self.root, bg=self.colors['button'], height=40)
-        toolbar.pack(fill='x', padx=10, pady=(10, 5))
-        toolbar.pack_propagate(False)
-
-        # View buttons
-        tk.Button(toolbar, text="⚡ Minimal", bg=self.colors['button'], fg=self.colors['fg'],
-                  font=('Arial', 10), bd=1, command=self.show_minimal_view).pack(side='left', padx=2)
-
-        tk.Button(toolbar, text="📊 Compact", bg=self.colors['button'], fg=self.colors['fg'],
-                  font=('Arial', 10), bd=1, command=self.show_compact_view).pack(side='left', padx=2)
-
-        tk.Button(toolbar, text="📈 Detailed", bg=self.colors['button'], fg=self.colors['fg'],
-                  font=('Arial', 10), bd=1, command=self.show_detailed_view).pack(side='left', padx=2)
-
-        # Status label
-        self.status_label = tk.Label(toolbar, text="Ready", bg=self.colors['button'],
-                                     fg=self.colors['success'], font=('Arial', 10))
-        self.status_label.pack(side='right', padx=10)
-
-    def show_minimal_view(self):
-        """Show minimal overlay view"""
-        if self.minimal_window and self.minimal_window.winfo_exists():
-            self.minimal_window.lift()
-        else:
-            self.minimal_window = MinimalView(self.root, self.monitor)
-
-    def show_compact_view(self):
-        """Show compact view with essential metrics"""
-        self.current_view = 'compact'
-        self.clear_main_frame()
+        self.status_label = ttk.Label(status_frame, text="Ready")
+        self.status_label.pack(side=tk.LEFT, padx=(10, 0))
 
         # System overview frame
-        overview_frame = ttk.Frame(self.main_frame)
+        overview_frame = ttk.Frame(self.compact_frame)
         overview_frame.pack(fill='x', pady=10)
 
         # Store metric cards for updates
@@ -389,40 +469,49 @@ class ByteDogApp:
 
         # CPU card
         cpu_card = self.create_metric_card(overview_frame, "CPU", 0, "%")
-        cpu_card.pack(side='left', padx=10)
+        cpu_card.pack(side='left', padx=5)
         self.metric_cards['cpu'] = cpu_card
 
         # Memory card
         mem_card = self.create_metric_card(overview_frame, "Memory", 0, "%")
-        mem_card.pack(side='left', padx=10)
+        mem_card.pack(side='left', padx=5)
         self.metric_cards['memory'] = mem_card
 
         # GPU card if available
         if GPU_AVAILABLE:
             gpu_card = self.create_metric_card(overview_frame, "GPU", 0, "%")
-            gpu_card.pack(side='left', padx=10)
+            gpu_card.pack(side='left', padx=5)
             self.metric_cards['gpu'] = gpu_card
 
         # Top processes
-        top_frame = ttk.Frame(self.main_frame)
+        top_frame = ttk.Frame(self.compact_frame)
         top_frame.pack(fill='both', expand=True, pady=10)
 
         tk.Label(top_frame, text="Top Processes", bg=self.colors['bg'], fg=self.colors['fg'],
                  font=('Arial', 12, 'bold')).pack(anchor='w', pady=5)
 
-        # Process list
-        self.create_process_list(top_frame)
+        # Simple process list for compact view
+        self.create_simple_process_list(top_frame)
 
-        # Start updating metrics
-        self.update_compact_metrics()
+    def create_detailed_view(self):
+        """Show detailed view with all metrics and full process management"""
+        self.detailed_frame = ttk.Frame(self.root, padding="10")
 
-    def show_detailed_view(self):
-        """Show detailed view with all metrics and graphs"""
-        self.current_view = 'detailed'
-        self.clear_main_frame()
+        # Title bar
+        title_frame = ttk.Frame(self.detailed_frame)
+        title_frame.pack(fill='x', pady=(0, 10))
+
+        title_label = ttk.Label(title_frame, text="ByteDog - Detailed View",
+                                font=('Arial', 10, 'bold'))
+        title_label.pack(side='left')
+
+        # View toggle button
+        self.detailed_toggle_btn = ttk.Button(title_frame, text="▲", width=3,
+                                              command=self.cycle_view_mode)
+        self.detailed_toggle_btn.pack(side='right')
 
         # Create notebook for tabs
-        notebook = ttk.Notebook(self.main_frame)
+        notebook = ttk.Notebook(self.detailed_frame)
         notebook.pack(fill='both', expand=True)
 
         # Overview tab
@@ -445,19 +534,99 @@ class ByteDogApp:
         notebook.add(network_tab, text='Network')
         self.create_network_tab(network_tab)
 
+    def create_menu(self):
+        """Create menu bar"""
+        menubar = tk.Menu(self.root, bg=self.colors['button'], fg=self.colors['fg'])
+        self.root.config(menu=menubar)
+
+        # File menu
+        file_menu = tk.Menu(menubar, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
+        menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Export Data...", command=self.export_data)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.root.quit)
+
+        # View menu
+        view_menu = tk.Menu(menubar, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
+        menubar.add_cascade(label="View", menu=view_menu)
+        view_menu.add_command(label="Minimal", command=lambda: self.set_view_mode("minimal"))
+        view_menu.add_command(label="Compact", command=lambda: self.set_view_mode("compact"))
+        view_menu.add_command(label="Detailed", command=lambda: self.set_view_mode("detailed"))
+
+        # Tools menu
+        tools_menu = tk.Menu(menubar, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+        tools_menu.add_command(label="Settings", command=self.show_settings)
+        tools_menu.add_command(label="Performance Report", command=self.generate_report)
+
+        # Help menu
+        help_menu = tk.Menu(menubar, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
+        menubar.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label="About", command=self.show_about)
+
+    def cycle_view_mode(self):
+        """Cycle through view modes: minimal -> compact -> detailed -> minimal"""
+        current_mode = self.view_mode.get()
+        if current_mode == "minimal":
+            self.view_mode.set("compact")
+        elif current_mode == "compact":
+            self.view_mode.set("detailed")
+        else:
+            self.view_mode.set("minimal")
+
+        self.update_view_mode()
+
+    def update_view_mode(self):
+        """Update the display based on current view mode"""
+        mode = self.view_mode.get()
+
+        # Hide all frames first
+        for widget in self.root.winfo_children():
+            widget.pack_forget()
+
+        if mode == "minimal":
+            # Minimal mode - just metrics, dot, and tiny expand button
+            self.minimal_frame.pack(fill='both', expand=True)
+            self.root.update_idletasks()
+
+            # Get the actual size needed and resize window
+            req_width = self.minimal_frame.winfo_reqwidth()
+            req_height = self.minimal_frame.winfo_reqheight()
+            self.root.geometry(f"{req_width}x{req_height}")
+
+            # Remove window decorations for true minimal look
+            self.root.overrideredirect(True)
+            self.main_frame.config(padding="0")
+
+        elif mode == "compact":
+            # Compact mode - essential info with window decorations
+            self.root.overrideredirect(False)
+            self.compact_frame.pack(fill='both', expand=True)
+            self.root.geometry("340x320")
+            if hasattr(self, 'toggle_btn'):
+                self.toggle_btn.config(text="▼")
+
+        else:  # detailed
+            # Detailed mode - all information
+            self.root.overrideredirect(False)
+            self.detailed_frame.pack(fill='both', expand=True)
+            self.root.geometry("450x700")
+            if hasattr(self, 'detailed_toggle_btn'):
+                self.detailed_toggle_btn.config(text="▲")
+
     def create_metric_card(self, parent, title, value, unit):
         """Create a metric display card"""
         card = tk.Frame(parent, bg=self.colors['button'], relief='raised', bd=1)
-        card.configure(width=150, height=100)
+        card.configure(width=90, height=70)
         card.pack_propagate(False)
 
         card.title_label = tk.Label(card, text=title, bg=self.colors['button'], fg=self.colors['fg'],
-                                    font=('Arial', 10))
-        card.title_label.pack(pady=5)
+                                    font=('Arial', 9))
+        card.title_label.pack(pady=2)
 
-        card.value_label = tk.Label(card, text=f"{value:.1f}{unit}",
+        card.value_label = tk.Label(card, text=f"{value:.0f}{unit}",
                                     bg=self.colors['button'], fg=self.colors['success'],
-                                    font=('Arial', 20, 'bold'))
+                                    font=('Arial', 14, 'bold'))
         card.value_label.pack()
 
         return card
@@ -467,10 +636,18 @@ class ByteDogApp:
         if isinstance(value, (int, float)):
             color = self.colors['success'] if value < 50 else self.colors['warning'] if value < 80 else self.colors[
                 'error']
-            card.value_label.config(text=f"{value:.1f}{unit}", fg=color)
+            card.value_label.config(text=f"{value:.0f}{unit}", fg=color)
+
+    def create_simple_process_list(self, parent):
+        """Create simple process list for compact view"""
+        # Simple text display for top processes
+        self.process_display = tk.Text(parent, height=8, bg=self.colors['button'],
+                                       fg=self.colors['fg'], font=('Consolas', 8),
+                                       state='disabled')
+        self.process_display.pack(fill='both', expand=True)
 
     def create_process_list(self, parent):
-        """Create process list view"""
+        """Create detailed process list view"""
         # Frame for list and scrollbar
         list_frame = ttk.Frame(parent)
         list_frame.pack(fill='both', expand=True)
@@ -500,9 +677,6 @@ class ByteDogApp:
         # Context menu
         self.process_tree.bind('<Button-3>', self.show_process_menu)
 
-        # Update process list
-        self.update_process_list()
-
     def create_overview_tab(self, parent):
         """Create overview tab content"""
         # System info
@@ -514,7 +688,13 @@ class ByteDogApp:
         system_info += f"CPU Cores: {psutil.cpu_count(logical=False)} physical, {psutil.cpu_count()} logical\n"
 
         mem = psutil.virtual_memory()
-        system_info += f"Total Memory: {mem.total / (1024 ** 3):.1f} GB"
+        system_info += f"Total Memory: {mem.total / (1024 ** 3):.1f} GB\n"
+
+        if GPU_AVAILABLE:
+            gpu_info = self.monitor.get_gpu_info()
+            if gpu_info:
+                system_info += f"GPU: {gpu_info['name']}\n"
+                system_info += f"GPU Memory: {gpu_info['memory_total']:.0f} MB"
 
         tk.Label(info_frame, text=system_info, bg=self.colors['bg'], fg=self.colors['fg'],
                  font=('Consolas', 10), justify='left').pack(anchor='w')
@@ -591,10 +771,41 @@ class ByteDogApp:
 
         self.update_network_info()
 
-    def clear_main_frame(self):
-        """Clear main frame content"""
-        for widget in self.main_frame.winfo_children():
-            widget.destroy()
+    def create_context_menu(self):
+        """Create right-click context menu"""
+        self.context_menu = tk.Menu(self.root, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
+        self.context_menu.add_command(label="Minimal View", command=lambda: self.set_view_mode("minimal"))
+        self.context_menu.add_command(label="Compact View", command=lambda: self.set_view_mode("compact"))
+        self.context_menu.add_command(label="Detailed View", command=lambda: self.set_view_mode("detailed"))
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Always on Top", command=self.toggle_topmost)
+        self.context_menu.add_command(label="Mini Window", command=self.show_minimal_view)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Exit", command=self.root.quit)
+
+    def set_view_mode(self, mode):
+        """Set specific view mode"""
+        self.view_mode.set(mode)
+        self.update_view_mode()
+
+    def show_context_menu(self, event):
+        """Show context menu"""
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.context_menu.grab_release()
+
+    def toggle_topmost(self):
+        """Toggle always on top"""
+        current = self.root.attributes('-topmost')
+        self.root.attributes('-topmost', not current)
+
+    def show_minimal_view(self):
+        """Show minimal overlay view"""
+        if self.minimal_window and self.minimal_window.winfo_exists():
+            self.minimal_window.lift()
+        else:
+            self.minimal_window = MinimalView(self.root, self.monitor)
 
     def sort_processes(self, column):
         """Sort process list by column"""
@@ -612,12 +823,14 @@ class ByteDogApp:
 
     def filter_processes(self):
         """Filter processes based on search"""
-        self.update_process_list()
+        if hasattr(self, 'process_tree'):
+            self.update_process_list()
 
     def refresh_processes(self):
         """Force refresh process list"""
         self.monitor.process_cache = []
-        self.update_process_list()
+        if hasattr(self, 'process_tree'):
+            self.update_process_list()
 
     def show_process_menu(self, event):
         """Show context menu for process"""
@@ -636,70 +849,74 @@ class ByteDogApp:
 
     def kill_selected_process(self):
         """Kill selected process"""
-        selection = self.process_tree.selection()
-        if selection:
-            item = self.process_tree.item(selection[0])
-            pid = item['values'][0]
-            name = item['values'][1]
+        if hasattr(self, 'process_tree'):
+            selection = self.process_tree.selection()
+            if selection:
+                item = self.process_tree.item(selection[0])
+                pid = item['values'][0]
+                name = item['values'][1]
 
-            if messagebox.askyesno("Confirm", f"Kill process '{name}' (PID: {pid})?"):
-                if self.process_manager.kill_process(pid):
-                    self.status_label.config(text=f"Killed process {pid}", fg=self.colors['success'])
-                else:
-                    self.status_label.config(text=f"Failed to kill process {pid}", fg=self.colors['error'])
-                self.refresh_processes()
+                if messagebox.askyesno("Confirm", f"Kill process '{name}' (PID: {pid})?"):
+                    if self.process_manager.kill_process(pid):
+                        self.status_label.config(text=f"Killed process {pid}", fg=self.colors['success'])
+                    else:
+                        self.status_label.config(text=f"Failed to kill process {pid}", fg=self.colors['error'])
+                    self.refresh_processes()
 
     def suspend_selected_process(self):
         """Suspend selected process"""
-        selection = self.process_tree.selection()
-        if selection:
-            item = self.process_tree.item(selection[0])
-            pid = item['values'][0]
+        if hasattr(self, 'process_tree'):
+            selection = self.process_tree.selection()
+            if selection:
+                item = self.process_tree.item(selection[0])
+                pid = item['values'][0]
 
-            if self.process_manager.suspend_process(pid):
-                self.status_label.config(text=f"Suspended process {pid}", fg=self.colors['success'])
-            else:
-                self.status_label.config(text=f"Failed to suspend process {pid}", fg=self.colors['error'])
-            self.refresh_processes()
+                if self.process_manager.suspend_process(pid):
+                    self.status_label.config(text=f"Suspended process {pid}", fg=self.colors['success'])
+                else:
+                    self.status_label.config(text=f"Failed to suspend process {pid}", fg=self.colors['error'])
+                self.refresh_processes()
 
     def resume_selected_process(self):
         """Resume selected process"""
-        selection = self.process_tree.selection()
-        if selection:
-            item = self.process_tree.item(selection[0])
-            pid = item['values'][0]
+        if hasattr(self, 'process_tree'):
+            selection = self.process_tree.selection()
+            if selection:
+                item = self.process_tree.item(selection[0])
+                pid = item['values'][0]
 
-            if self.process_manager.resume_process(pid):
-                self.status_label.config(text=f"Resumed process {pid}", fg=self.colors['success'])
-            else:
-                self.status_label.config(text=f"Failed to resume process {pid}", fg=self.colors['error'])
-            self.refresh_processes()
+                if self.process_manager.resume_process(pid):
+                    self.status_label.config(text=f"Resumed process {pid}", fg=self.colors['success'])
+                else:
+                    self.status_label.config(text=f"Failed to resume process {pid}", fg=self.colors['error'])
+                self.refresh_processes()
 
     def show_process_details(self):
         """Show detailed process information"""
-        selection = self.process_tree.selection()
-        if selection:
-            item = self.process_tree.item(selection[0])
-            pid = item['values'][0]
-
-            try:
-                proc = psutil.Process(pid)
-                info = f"Process Details\n" + "=" * 50 + "\n"
-                info += f"PID: {pid}\n"
-                info += f"Name: {proc.name()}\n"
-                info += f"Status: {proc.status()}\n"
-                info += f"Created: {datetime.fromtimestamp(proc.create_time())}\n"
-                info += f"Memory %: {proc.memory_percent():.2f}\n"
-                info += f"Threads: {proc.num_threads()}\n"
+        if hasattr(self, 'process_tree'):
+            selection = self.process_tree.selection()
+            if selection:
+                item = self.process_tree.item(selection[0])
+                pid = item['values'][0]
 
                 try:
-                    info += f"Path: {proc.exe()}\n"
-                except:
-                    pass
+                    proc = psutil.Process(pid)
+                    info = f"Process Details\n" + "=" * 50 + "\n"
+                    info += f"PID: {pid}\n"
+                    info += f"Name: {proc.name()}\n"
+                    info += f"Status: {proc.status()}\n"
+                    info += f"Created: {datetime.fromtimestamp(proc.create_time())}\n"
+                    info += f"Memory %: {proc.memory_percent():.2f}\n"
+                    info += f"Threads: {proc.num_threads()}\n"
 
-                messagebox.showinfo("Process Details", info)
-            except:
-                messagebox.showerror("Error", "Could not retrieve process details")
+                    try:
+                        info += f"Path: {proc.exe()}\n"
+                    except:
+                        pass
+
+                    messagebox.showinfo("Process Details", info)
+                except:
+                    messagebox.showerror("Error", "Could not retrieve process details")
 
     def update_process_list(self):
         """Update the process list display"""
@@ -731,32 +948,121 @@ class ByteDogApp:
                 proc['status']
             ))
 
-    def update_compact_metrics(self):
-        """Update compact view metrics"""
-        if self.current_view != 'compact':
+    def update_simple_process_display(self):
+        """Update simple process display for compact view"""
+        if not hasattr(self, 'process_display'):
             return
 
+        processes = self.monitor.get_process_list(use_cache=True)
+
+        # Clear and update
+        self.process_display.config(state='normal')
+        self.process_display.delete(1.0, tk.END)
+
+        text = "TOP PROCESSES (by Memory)\n"
+        text += "-" * 30 + "\n"
+
+        for i, proc in enumerate(processes[:8]):  # Top 8 processes
+            name = proc['name'][:15] if len(proc['name']) > 15 else proc['name']
+            mem_pct = proc.get('memory_percent', 0)
+            text += f"{name:<15} {mem_pct:>6.1f}%\n"
+
+        self.process_display.insert(1.0, text)
+        self.process_display.config(state='disabled')
+
+    def update_metrics(self):
+        """Update all metrics displays"""
         try:
-            # Update CPU
+            # Get current data
             cpu = self.monitor.get_cpu_usage()
-            if 'cpu' in self.metric_cards:
-                self.update_metric_card(self.metric_cards['cpu'], cpu)
-
-            # Update Memory
             mem = self.monitor.get_memory_info()
-            if 'memory' in self.metric_cards:
-                self.update_metric_card(self.metric_cards['memory'], mem['percent'])
+            gpu_info = self.monitor.get_gpu_info() if GPU_AVAILABLE else None
 
-            # Update GPU if available
-            if GPU_AVAILABLE and 'gpu' in self.metric_cards:
-                gpu_info = self.monitor.get_gpu_info()
-                if gpu_info:
+            # Update minimal view
+            if self.view_mode.get() == "minimal":
+                # Update minimal display
+                metrics_text = f"CPU: {cpu:.0f}% | RAM: {mem['percent']:.0f}%"
+                if GPU_AVAILABLE and gpu_info:
+                    metrics_text += f" | GPU: {gpu_info['load']:.0f}%"
+
+                self.minimal_metrics_label.config(text=metrics_text)
+
+                # Update status dot color based on overall system load
+                max_usage = max(cpu, mem['percent'])
+                if GPU_AVAILABLE and gpu_info:
+                    max_usage = max(max_usage, gpu_info['load'])
+
+                if max_usage < 50:
+                    dot_color = 'lime'
+                elif max_usage < 80:
+                    dot_color = 'yellow'
+                else:
+                    dot_color = 'red'
+
+                self.minimal_dot_canvas.itemconfig(self.minimal_dot, fill=dot_color)
+
+            # Update compact view metric cards
+            elif self.view_mode.get() == "compact":
+                if 'cpu' in self.metric_cards:
+                    self.update_metric_card(self.metric_cards['cpu'], cpu)
+
+                if 'memory' in self.metric_cards:
+                    self.update_metric_card(self.metric_cards['memory'], mem['percent'])
+
+                if GPU_AVAILABLE and 'gpu' in self.metric_cards and gpu_info:
                     self.update_metric_card(self.metric_cards['gpu'], gpu_info['load'])
-        except:
-            pass
 
-        # Schedule next update
-        self.root.after(2000, self.update_compact_metrics)
+                # Update simple process display
+                self.update_simple_process_display()
+
+                # Update status indicator
+                overall_status = self.calculate_overall_status(cpu, mem['percent'], gpu_info)
+                status_colors = {'good': 'green', 'fair': 'orange', 'poor': 'red'}
+                if hasattr(self, 'status_canvas'):
+                    self.status_canvas.itemconfig(self.status_indicator,
+                                                  fill=status_colors.get(overall_status, 'gray'))
+                    self.status_label.config(text=f"Status: {overall_status.title()}")
+
+            # Update detailed view
+            elif self.view_mode.get() == "detailed":
+                # Update CPU cores if visible
+                if hasattr(self, 'core_labels'):
+                    cores = self.monitor.get_cpu_per_core()
+                    for i, label in enumerate(self.core_labels):
+                        if i < len(cores):
+                            usage = cores[i]
+                            color = self.colors['success'] if usage < 50 else self.colors['warning'] if usage < 80 else \
+                            self.colors['error']
+                            label.config(text=f"Core {i}: {usage:.1f}%", fg=color)
+
+                # Update process list if visible
+                if hasattr(self, 'process_tree'):
+                    self.update_process_list()
+
+        except Exception as e:
+            print(f"Metrics update error: {e}")
+
+    def calculate_overall_status(self, cpu, mem_percent, gpu_info):
+        """Calculate overall system status"""
+        poor_conditions = 0
+        total_conditions = 2  # CPU and Memory
+
+        if cpu > 80:
+            poor_conditions += 1
+        if mem_percent > 80:
+            poor_conditions += 1
+
+        if GPU_AVAILABLE and gpu_info:
+            total_conditions += 1
+            if gpu_info['load'] > 80:
+                poor_conditions += 1
+
+        if poor_conditions == 0:
+            return 'good'
+        elif poor_conditions < total_conditions:
+            return 'fair'
+        else:
+            return 'poor'
 
     def update_performance_graph(self):
         """Update performance history graph"""
@@ -801,7 +1107,7 @@ class ByteDogApp:
         self.perf_text.tag_config('title', foreground=self.colors['accent'], font=('Arial', 11, 'bold'))
 
         # Schedule next update
-        if self.current_view == 'detailed':
+        if self.view_mode.get() == 'detailed':
             self.root.after(2000, self.update_performance_graph)
 
     def create_text_graph(self, data, height, width):
@@ -811,16 +1117,24 @@ class ByteDogApp:
 
         graph = []
 
+        # Filter out None values
+        valid_data = [v for v in data if v is not None]
+        if len(valid_data) < 2:
+            return "Collecting data...\n"
+
         # Scale data to fit height
-        max_val = max(data) if data else 100
-        min_val = 0
+        max_val = max(valid_data)
+        min_val = min(valid_data)
+
+        if max_val == min_val:
+            max_val += 1
 
         # Create graph lines
         for h in range(height, -1, -1):
             threshold = (h / height) * max_val
             line = f"{threshold:3.0f}% |"
 
-            for i, val in enumerate(list(data)[-width:]):
+            for i, val in enumerate(list(valid_data)[-width:]):
                 if val >= threshold:
                     line += "█"
                 else:
@@ -829,9 +1143,9 @@ class ByteDogApp:
             graph.append(line + "\n")
 
         # Add bottom axis
-        graph.append("     +" + "-" * min(len(data), width) + "\n")
-        graph.append(
-            "      " + "".join([str(i % 10) if i % 10 == 0 else " " for i in range(min(len(data), width))]) + "\n")
+        graph.append("     +" + "-" * min(len(valid_data), width) + "\n")
+        graph.append("      " + "".join(
+            [str(i % 10) if i % 10 == 0 else " " for i in range(min(len(valid_data), width))]) + "\n")
 
         return "".join(graph)
 
@@ -862,34 +1176,47 @@ class ByteDogApp:
         self.net_info_label.config(text=info)
 
         # Schedule next update
-        if self.current_view == 'detailed':
+        if self.view_mode.get() == 'detailed':
             self.root.after(2000, self.update_network_info)
 
-    def update_detailed_view(self):
-        """Update detailed view metrics"""
-        if self.current_view != 'detailed':
-            return
+    def start_monitoring(self):
+        """Start the monitoring thread"""
 
-        # Update CPU cores
-        if hasattr(self, 'core_labels'):
-            cores = self.monitor.get_cpu_per_core()
-            for i, label in enumerate(self.core_labels):
-                if i < len(cores):
-                    usage = cores[i]
-                    color = self.colors['success'] if usage < 50 else self.colors['warning'] if usage < 80 else \
-                    self.colors['error']
-                    label.config(text=f"Core {i}: {usage:.1f}%", fg=color)
+        def monitor_loop():
+            while True:
+                try:
+                    # Collect data in background
+                    data = {
+                        'cpu': self.monitor.get_cpu_usage(),
+                        'memory': self.monitor.get_memory_info(),
+                        'processes': self.monitor.get_process_list(use_cache=False)
+                    }
 
-        # Schedule next update
-        self.root.after(2000, self.update_detailed_view)
+                    if GPU_AVAILABLE:
+                        data['gpu'] = self.monitor.get_gpu_info()
 
-    def format_bytes(self, bytes):
-        """Format bytes to human readable format"""
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if bytes < 1024.0:
-                return f"{bytes:.2f} {unit}"
-            bytes /= 1024.0
-        return f"{bytes:.2f} PB"
+                    # Queue data for UI update
+                    self.data_queue.put(data)
+                except Exception as e:
+                    print(f"Monitoring error: {e}")
+
+                time.sleep(self.monitor.update_interval)
+
+        monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+        monitor_thread.start()
+
+    def process_queue(self):
+        """Process data from monitoring thread"""
+        try:
+            while True:
+                data = self.data_queue.get_nowait()
+                # Update metrics based on current view
+                self.update_metrics()
+        except queue.Empty:
+            pass
+
+        # Schedule next check
+        self.root.after(1000, self.process_queue)
 
     def export_data(self):
         """Export system data to file"""
@@ -938,8 +1265,8 @@ class ByteDogApp:
                     with open(filename, 'w') as f:
                         json.dump(data, f, indent=2, default=str)
 
-                self.status_label.config(text=f"Data exported to {os.path.basename(filename)}",
-                                         fg=self.colors['success'])
+                if hasattr(self, 'status_label'):
+                    self.status_label.config(text=f"Data exported to {os.path.basename(filename)}")
             except Exception as e:
                 messagebox.showerror("Export Error", f"Failed to export data: {str(e)}")
 
@@ -978,6 +1305,13 @@ class ByteDogApp:
         report_window.geometry("600x500")
         report_window.configure(bg=self.colors['bg'])
 
+        # Window icon for Windows
+        if platform.system() == "Windows":
+            try:
+                report_window.iconbitmap(resource_path("ByteDog_256.ico"))
+            except Exception:
+                pass
+
         text = tk.Text(report_window, bg=self.colors['button'], fg=self.colors['fg'],
                        font=('Consolas', 10))
         text.pack(fill='both', expand=True, padx=10, pady=10)
@@ -1001,8 +1335,8 @@ class ByteDogApp:
             try:
                 with open(filename, 'w') as f:
                     f.write(report)
-                self.status_label.config(text=f"Report saved to {os.path.basename(filename)}",
-                                         fg=self.colors['success'])
+                if hasattr(self, 'status_label'):
+                    self.status_label.config(text=f"Report saved to {os.path.basename(filename)}")
             except Exception as e:
                 messagebox.showerror("Save Error", f"Failed to save report: {str(e)}")
 
@@ -1012,6 +1346,13 @@ class ByteDogApp:
         settings_window.title("Settings")
         settings_window.geometry("400x300")
         settings_window.configure(bg=self.colors['bg'])
+
+        # Window icon for Windows
+        if platform.system() == "Windows":
+            try:
+                settings_window.iconbitmap(resource_path("ByteDog_256.ico"))
+            except Exception:
+                pass
 
         # Update interval
         tk.Label(settings_window, text="Update Interval (seconds):", bg=self.colors['bg'],
@@ -1025,30 +1366,18 @@ class ByteDogApp:
 
         # Always on top option
         always_top_var = tk.BooleanVar()
-        tk.Checkbutton(settings_window, text="Always on top (minimal view)",
+        tk.Checkbutton(settings_window, text="Always on top",
                        variable=always_top_var, bg=self.colors['bg'], fg=self.colors['fg'],
                        selectcolor=self.colors['button']).pack(pady=10)
-
-        # Theme selection
-        tk.Label(settings_window, text="Theme:", bg=self.colors['bg'],
-                 fg=self.colors['fg']).pack(pady=5)
-
-        theme_var = tk.StringVar(value="Dark")
-        theme_frame = tk.Frame(settings_window, bg=self.colors['bg'])
-        theme_frame.pack()
-
-        tk.Radiobutton(theme_frame, text="Dark", variable=theme_var, value="Dark",
-                       bg=self.colors['bg'], fg=self.colors['fg'],
-                       selectcolor=self.colors['button']).pack(side='left')
-        tk.Radiobutton(theme_frame, text="Light", variable=theme_var, value="Light",
-                       bg=self.colors['bg'], fg=self.colors['fg'],
-                       selectcolor=self.colors['button']).pack(side='left')
 
         # Save button
         def save_settings():
             self.monitor.update_interval = interval_var.get()
+            if always_top_var.get():
+                self.root.attributes('-topmost', True)
             settings_window.destroy()
-            self.status_label.config(text="Settings saved", fg=self.colors['success'])
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text="Settings saved")
 
         tk.Button(settings_window, text="Save", bg=self.colors['button'], fg=self.colors['fg'],
                   command=save_settings).pack(pady=20)
@@ -1065,7 +1394,7 @@ Features:
 • Minimal resource usage (<50MB RAM)
 • Real-time CPU, Memory, GPU monitoring
 • Process management capabilities
-• Multiple view modes
+• Multiple view modes (NetDog-style toggling)
 • Cross-platform support
 
 Created with Python and psutil
@@ -1073,54 +1402,33 @@ Created with Python and psutil
 
         messagebox.showinfo("About ByteDog", about_text)
 
-    def start_monitoring(self):
-        """Start the monitoring thread"""
-
-        def monitor_loop():
-            while True:
-                try:
-                    # Collect data in background
-                    data = {
-                        'cpu': self.monitor.get_cpu_usage(),
-                        'memory': self.monitor.get_memory_info(),
-                        'processes': self.monitor.get_process_list(use_cache=False)
-                    }
-
-                    if GPU_AVAILABLE:
-                        data['gpu'] = self.monitor.get_gpu_info()
-
-                    # Queue data for UI update
-                    self.data_queue.put(data)
-                except:
-                    pass
-
-                time.sleep(self.monitor.update_interval)
-
-        monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-        monitor_thread.start()
-
-    def process_queue(self):
-        """Process data from monitoring thread"""
-        try:
-            while True:
-                data = self.data_queue.get_nowait()
-
-                # Update process list if visible
-                if hasattr(self, 'process_tree'):
-                    self.update_process_list()
-
-                # Update view-specific elements
-                if self.current_view == 'detailed':
-                    self.update_detailed_view()
-        except queue.Empty:
-            pass
-
-        # Schedule next check
-        self.root.after(1000, self.process_queue)
+    def format_bytes(self, bytes_val):
+        """Format bytes to human readable format"""
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if bytes_val < 1024.0:
+                return f"{bytes_val:.2f} {unit}"
+            bytes_val /= 1024.0
+        return f"{bytes_val:.2f} PB"
 
     def run(self):
         """Start the application"""
+        # Start metric updates
+        self.update_metrics()
+        self.root.after(2000, self.schedule_metric_updates)
+
+        # Handle window closing
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.root.mainloop()
+
+    def schedule_metric_updates(self):
+        """Schedule regular metric updates"""
+        self.update_metrics()
+        self.root.after(2000, self.schedule_metric_updates)
+
+    def on_closing(self):
+        """Handle application closing"""
+        self.root.quit()
+        self.root.destroy()
 
 
 def main():
@@ -1134,9 +1442,16 @@ def main():
         except:
             pass
 
+    # Check if GPU monitoring is available
+    if GPU_AVAILABLE:
+        print("✅ GPU monitoring available")
+    else:
+        print("⚠️  GPU monitoring not available (install: pip install gputil)")
+
     app = ByteDogApp()
     app.run()
 
 
 if __name__ == "__main__":
     main()
+
