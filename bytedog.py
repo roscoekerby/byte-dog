@@ -20,6 +20,12 @@ import subprocess
 import sys
 import queue
 
+from guardian import (
+    DEFAULT_PROTECTED, GuardianConfig, EscalationEngine,
+    fast_memory_snapshot, enrich_chromium, select_targets, group_by_name,
+    harden_self, install_autostart, uninstall_autostart, autostart_installed,
+)
+
 # Try to import optional dependencies
 try:
     import GPUtil
@@ -211,29 +217,27 @@ class ProcessManager:
 
 
 class RAMGuardian:
-    """Proactive RAM pressure monitor — detects hogs, leaks, and prevents OOM crashes."""
+    """Proactive RAM pressure monitor — escalating thrash prevention.
+    Decision logic lives in guardian.EscalationEngine; this class holds
+    runtime state (event log, suspended pids, leak tracking)."""
 
-    # Processes that must never be auto-killed or suspended
-    PROTECTED = {
-        'system', 'svchost.exe', 'csrss.exe', 'wininit.exe', 'winlogon.exe',
-        'lsass.exe', 'services.exe', 'smss.exe', 'explorer.exe', 'dwm.exe',
-        'registry', 'idle', 'memory compression', 'memcompression',
-        'python.exe', 'pythonw.exe', 'bytedog.exe', 'msmpeng.exe',
-        'audiodg.exe', 'taskhostw.exe', 'runtimebroker.exe',
-        'fontdrvhost.exe', 'spoolsv.exe', 'ntoskrnl.exe', 'vmmem',
-    }
+    PROTECTED = DEFAULT_PROTECTED
 
-    def __init__(self, threshold=80.0):
-        self.threshold = threshold           # % RAM to trigger action
-        self.warn_threshold = threshold - 5  # % RAM for early warning
-        self.action = 'warn'                 # 'warn', 'suspend', 'kill'
+    def __init__(self, config=None):
+        self.config = config or GuardianConfig.load()
+        self.engine = EscalationEngine(self.config)
         self.enabled = True
         self.event_log = deque(maxlen=100)
-        self.last_action_time = 0
-        self.action_cooldown = 30            # seconds between auto-actions
+        self.suspended = {}                  # pid -> name (auto-suspended)
         self.process_memory_history = {}     # pid -> deque of (timestamp, rss_bytes)
         self._lock = threading.Lock()
         self.total_ram = psutil.virtual_memory().total
+
+    def save_config(self):
+        try:
+            self.config.save()
+        except OSError as e:
+            self.log_event('warn', f"Config save failed: {e}")
 
     def log_event(self, level, message):
         """Record an event. level: 'info', 'warn', 'critical', 'action'"""
@@ -248,9 +252,10 @@ class RAMGuardian:
 
     def get_top_hogs(self, processes, n=5):
         """Top N non-protected processes by memory %"""
+        protected = self.config.protected_names()
         unprotected = [
             p for p in processes
-            if p.get('name', '').lower() not in self.PROTECTED
+            if p.get('name', '').lower() not in protected
             and (p.get('memory_percent') or 0) > 0.05
         ]
         return sorted(unprotected, key=lambda x: x.get('memory_percent') or 0, reverse=True)[:n]
@@ -293,44 +298,30 @@ class RAMGuardian:
         return sorted(suspects, key=lambda x: x['growth_mb_min'], reverse=True)
 
     def check_ram(self, mem_info):
-        """Check RAM pressure using only virtual_memory() — instant, no process scanning."""
-        if not self.enabled:
-            return None
-        ram_pct = mem_info['percent']
-        now = time.time()
-        if (now - self.last_action_time) < self.action_cooldown:
+        """Check RAM pressure using only virtual_memory() — instant, no process scanning.
+        Returns a guardian event dict when the escalation engine decides to act."""
+        self.engine.enabled = self.enabled
+        decision = self.engine.evaluate(
+            mem_info['percent'], mem_info.get('swap_used', 0), time.time())
+        if decision is None:
             return None
 
+        ram_pct = mem_info['percent']
         used_gb = mem_info['used'] / (1024 ** 3)
         total_gb = mem_info['total'] / (1024 ** 3)
 
-        if ram_pct >= self.threshold:
-            msg = f"RAM {ram_pct:.1f}% ({used_gb:.1f}/{total_gb:.0f} GB) — threshold exceeded"
-            event = self.log_event('critical', msg)
-            self.last_action_time = now
-            return {
-                'type': 'critical',
-                'ram_pct': ram_pct,
-                'used_gb': used_gb,
-                'total_gb': total_gb,
-                'hogs': [],           # filled in async by handle_guardian_event
-                'action_needed': self.action,
-                'event': event,
-            }
-        elif ram_pct >= self.warn_threshold:
-            msg = f"RAM warning {ram_pct:.1f}% ({used_gb:.1f}/{total_gb:.0f} GB)"
-            event = self.log_event('warn', msg)
-            self.last_action_time = now
-            return {
-                'type': 'warn',
-                'ram_pct': ram_pct,
-                'used_gb': used_gb,
-                'total_gb': total_gb,
-                'hogs': [],
-                'action_needed': 'warn',
-                'event': event,
-            }
-        return None
+        level = 'critical' if decision.real_tier in ('suspend', 'kill') else 'warn'
+        event = self.log_event(
+            level, f"{decision.reason} ({used_gb:.1f}/{total_gb:.0f} GB) -> {decision.tier}")
+        return {
+            'type': decision.tier,          # 'warn' | 'suspend' | 'kill'
+            'real_tier': decision.real_tier,
+            'reason': decision.reason,
+            'ram_pct': ram_pct,
+            'used_gb': used_gb,
+            'total_gb': total_gb,
+            'event': event,
+        }
 
 
 class MinimalView(tk.Toplevel):
@@ -433,7 +424,7 @@ class ByteDogApp:
 
         self.monitor = SystemMonitor()
         self.process_manager = ProcessManager()
-        self.guardian = RAMGuardian(threshold=80.0)
+        self.guardian = RAMGuardian()
         self.guardian_queue = queue.Queue()
         self.guardian_alert_window = None
 
@@ -743,6 +734,10 @@ class ByteDogApp:
         tools_menu.add_command(label="Performance Report", command=self.generate_report)
         tools_menu.add_separator()
         tools_menu.add_command(label="Toggle RAM Guardian", command=self._menu_toggle_guardian)
+        tools_menu.add_command(label="Resume Suspended Processes", command=self._resume_all_suspended)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Install Auto-Start (login)", command=self._menu_install_autostart)
+        tools_menu.add_command(label="Remove Auto-Start", command=self._menu_uninstall_autostart)
 
         # Help menu
         help_menu = tk.Menu(menubar, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
@@ -1230,18 +1225,18 @@ class ByteDogApp:
                 # Update guardian compact badge
                 if hasattr(self, 'guardian_compact_label'):
                     ram_pct = mem['percent']
-                    thresh = self.guardian.threshold
+                    cfg = self.guardian.config
                     if not self.guardian.enabled:
                         g_text = "Shield: OFF"
                         g_color = '#666666'
-                    elif ram_pct >= thresh:
+                    elif ram_pct >= cfg.act_pct:
                         g_text = f"Shield: {ram_pct:.0f}%!! ALERT"
                         g_color = self.colors['error']
-                    elif ram_pct >= thresh - 5:
+                    elif ram_pct >= cfg.warn_pct:
                         g_text = f"Shield: {ram_pct:.0f}% WARN"
                         g_color = self.colors['warning']
                     else:
-                        g_text = f"Shield: {ram_pct:.0f}/{thresh:.0f}% OK"
+                        g_text = f"Shield: {ram_pct:.0f}/{cfg.warn_pct:.0f}% OK"
                         g_color = self.colors['success']
                     self.guardian_compact_label.config(text=g_text, fg=g_color)
 
@@ -1651,6 +1646,19 @@ Created with Python and psutil
 
     # ── RAM Guardian methods ────────────────────────────────────────────────
 
+    def _menu_install_autostart(self):
+        ok, msg = install_autostart()
+        (messagebox.showinfo if ok else messagebox.showerror)("Auto-Start", msg)
+        self.guardian.log_event('info' if ok else 'warn', msg)
+
+    def _menu_uninstall_autostart(self):
+        if not autostart_installed():
+            messagebox.showinfo("Auto-Start", "Auto-start is not installed.")
+            return
+        ok, msg = uninstall_autostart()
+        (messagebox.showinfo if ok else messagebox.showerror)("Auto-Start", msg)
+        self.guardian.log_event('info' if ok else 'warn', msg)
+
     def _menu_toggle_guardian(self):
         """Toggle guardian on/off from menu"""
         self.guardian.enabled = not self.guardian.enabled
@@ -1660,46 +1668,96 @@ Created with Python and psutil
             self.status_label.config(text=f"Guardian {state}")
 
     def handle_guardian_event(self, event):
-        """Show guardian alert immediately, then scan for hogs in background."""
-        # Show alert right away with RAM info — no process scan needed yet
+        """Show guardian alert immediately, then snapshot + auto-act in background.
+        The snapshot is one Norton-safe syscall (~5ms), so hogs appear instantly."""
         self.show_guardian_alert(event)
+        tier = event['type']
 
-        # If action is suspend/kill, scan for top hog async then act
-        if event['type'] == 'critical' and event['action_needed'] in ('kill', 'suspend'):
-            def _after_scan(processes):
-                hogs = self.guardian.get_top_hogs(processes)
-                if not hogs:
-                    return
-                top = hogs[0]
-                pid, name = top.get('pid'), top.get('name', 'unknown')
-                action = event['action_needed']
-                if action == 'kill' and pid and self.process_manager.kill_process(pid):
-                    self.guardian.log_event('action', f"Killed {name} (PID {pid})")
-                elif action == 'suspend' and pid and self.process_manager.suspend_process(pid):
-                    self.guardian.log_event('action', f"Suspended {name} (PID {pid})")
-            self.trigger_process_scan(callback=_after_scan)
+        def _worker():
+            try:
+                procs = enrich_chromium(fast_memory_snapshot())
+                groups = group_by_name(procs)[:6]
+                action_msg = None
+                if tier in ('suspend', 'kill'):
+                    action_msg = self._auto_act(tier, procs)
+                self.root.after(0, lambda: self.update_alert_hogs(groups, action_msg))
+            except Exception as e:
+                print(f"Guardian worker error: {e}")
 
-    def show_guardian_alert(self, event, auto_action=None):
-        """Non-blocking, auto-closing alert window for guardian events."""
-        # Don't stack alerts
-        if self.guardian_alert_window and self.guardian_alert_window.winfo_exists():
+        threading.Thread(target=_worker, daemon=True, name='ByteDogGuardianAct').start()
+
+    def _auto_act(self, tier, procs):
+        """Suspend or kill the top eligible hog. Runs on a worker thread.
+        Walks down the target list on AccessDenied/vanished processes."""
+        targets = select_targets(
+            procs, self.guardian.config.protected_names(),
+            suspended_pids=set(self.guardian.suspended), n=5, self_pid=os.getpid())
+        if not targets:
+            msg = "No eligible target (all processes protected)"
+            self.guardian.log_event('warn', msg)
+            return msg
+
+        for t in targets:
+            pid, name, gb = t['pid'], t['name'], t['rss'] / (1024 ** 3)
+            if tier == 'kill':
+                if self.process_manager.kill_process(pid):
+                    self.guardian.engine.record_kill(time.time())
+                    self.guardian.suspended.pop(pid, None)
+                    msg = f"Killed {name} (PID {pid}, {gb:.1f} GB freed)"
+                    self.guardian.log_event('action', msg)
+                    return msg
+            else:
+                if self.process_manager.suspend_process(pid):
+                    self.guardian.suspended[pid] = name
+                    msg = f"Suspended {name} (PID {pid}, {gb:.1f} GB frozen)"
+                    self.guardian.log_event('action', msg)
+                    return msg
+            self.guardian.log_event('warn', f"Could not {tier} {name} (PID {pid}), trying next")
+        msg = f"All {tier} attempts failed (access denied?)"
+        self.guardian.log_event('warn', msg)
+        return msg
+
+    def _resume_all_suspended(self):
+        """Resume everything the guardian auto-suspended."""
+        if not self.guardian.suspended:
             return
+        for pid, name in list(self.guardian.suspended.items()):
+            if self.process_manager.resume_process(pid):
+                self.guardian.log_event('action', f"Resumed {name} (PID {pid})")
+            self.guardian.suspended.pop(pid, None)
+        if hasattr(self, 'status_label'):
+            self.status_label.config(text="Resumed suspended processes")
+
+    TIER_RANK = {'warn': 0, 'suspend': 1, 'kill': 2}
+
+    def show_guardian_alert(self, event):
+        """Non-blocking rescue alert. Warn alerts auto-close; suspend/kill
+        alerts stay open. A more severe event replaces an open alert."""
+        tier = event['type']
+        existing = self.guardian_alert_window
+        if existing and existing.winfo_exists():
+            if self.TIER_RANK.get(tier, 0) <= self.TIER_RANK.get(
+                    getattr(existing, 'tier', 'warn'), 0):
+                return
+            existing.destroy()
 
         alert = tk.Toplevel(self.root)
+        alert.tier = tier
         alert.title("ByteDog Guardian")
         alert.attributes('-topmost', True)
         alert.configure(bg='#1a1a1a')
         alert.resizable(False, False)
 
-        # Position top-right corner
         screen_w = alert.winfo_screenwidth()
-        alert.geometry(f"330x230+{screen_w - 350}+80")
+        alert.geometry(f"360x300+{screen_w - 380}+80")
 
-        is_critical = event['type'] == 'critical'
-        hdr_color = '#f44336' if is_critical else '#ff9800'
-        icon = '!! CRITICAL' if is_critical else '! WARNING'
+        headers = {
+            'warn': ('#ff9800', '! WARNING'),
+            'suspend': ('#e64a19', '!! SUSPENDING HOG'),
+            'kill': ('#f44336', '!!! KILLING HOG'),
+        }
+        hdr_color, icon = headers.get(tier, headers['warn'])
 
-        # Header
         hdr = tk.Frame(alert, bg=hdr_color)
         hdr.pack(fill='x')
         tk.Label(hdr, text=f"  RAM GUARDIAN {icon}",
@@ -1709,61 +1767,81 @@ Created with Python and psutil
         body = tk.Frame(alert, bg='#1a1a1a')
         body.pack(fill='both', expand=True, padx=10, pady=8)
 
-        # RAM bar
         ram_pct = event['ram_pct']
         used = event.get('used_gb', 0)
         total = event.get('total_gb', 0)
         tk.Label(body, text=f"RAM Usage: {ram_pct:.1f}%  ({used:.1f} / {total:.0f} GB)",
                  bg='#1a1a1a', fg='white', font=('Arial', 10, 'bold')).pack(anchor='w')
 
-        # Canvas RAM bar
         bar_frame = tk.Frame(body, bg='#1a1a1a')
-        bar_frame.pack(fill='x', pady=(2, 8))
+        bar_frame.pack(fill='x', pady=(2, 6))
         bar_bg = tk.Canvas(bar_frame, height=8, bg='#333333', highlightthickness=0)
         bar_bg.pack(fill='x')
         bar_bg.update_idletasks()
-        bar_w = bar_bg.winfo_width() or 300
+        bar_w = bar_bg.winfo_width() or 330
         fill_w = int(bar_w * ram_pct / 100)
-        fill_color = '#f44336' if ram_pct >= self.guardian.threshold else '#ff9800'
+        fill_color = '#f44336' if ram_pct >= self.guardian.config.act_pct else '#ff9800'
         bar_bg.create_rectangle(0, 0, fill_w, 8, fill=fill_color, outline='')
 
-        # Top hogs
         tk.Label(body, text="Top memory users:",
                  bg='#1a1a1a', fg='#aaaaaa', font=('Arial', 8)).pack(anchor='w')
-        for hog in event.get('hogs', [])[:4]:
-            name = hog.get('name', '?')[:24]
-            pct = hog.get('memory_percent', 0)
-            mb = hog.get('memory_bytes', 0) / (1024 * 1024)
-            tk.Label(body, text=f"  {name:<24}  {pct:.1f}%  ({mb:.0f} MB)",
-                     bg='#1a1a1a', fg='white', font=('Consolas', 8)).pack(anchor='w')
+        self.guardian_alert_hogs = tk.Label(body, text="  scanning...",
+                                            bg='#1a1a1a', fg='white',
+                                            font=('Consolas', 8), justify='left')
+        self.guardian_alert_hogs.pack(anchor='w')
 
-        if auto_action:
-            tk.Label(body, text=f"  Action: {auto_action}",
-                     bg='#1a1a1a', fg='#4caf50', font=('Arial', 8, 'bold')).pack(anchor='w', pady=(4, 0))
+        self.guardian_alert_action = tk.Label(body, text="",
+                                              bg='#1a1a1a', fg='#4caf50',
+                                              font=('Arial', 8, 'bold'),
+                                              wraplength=330, justify='left')
+        self.guardian_alert_action.pack(anchor='w', pady=(4, 0))
 
-        # Footer: countdown + dismiss
+        # Rescue buttons
+        btns = tk.Frame(alert, bg='#1a1a1a')
+        btns.pack(fill='x', padx=10, pady=(0, 4))
+        for label, cmd in (("Kill Top Hog", self._kill_top_hog_now),
+                           ("Suspend Top", self._suspend_top_hog_now),
+                           ("Resume All", self._resume_all_suspended)):
+            tk.Button(btns, text=label, bg='#2d2d2d', fg='white',
+                      relief='flat', font=('Arial', 8),
+                      command=cmd).pack(side='left', padx=(0, 4))
+
         footer = tk.Frame(alert, bg='#1a1a1a')
         footer.pack(fill='x', padx=10, pady=(0, 8))
-
-        countdown_lbl = tk.Label(footer, text="Closing in 10s",
-                                  bg='#1a1a1a', fg='#555555', font=('Arial', 7))
+        countdown_lbl = tk.Label(footer, text="", bg='#1a1a1a', fg='#555555',
+                                 font=('Arial', 7))
         countdown_lbl.pack(side='left')
-
         tk.Button(footer, text="Dismiss", bg='#2d2d2d', fg='white',
                   relief='flat', font=('Arial', 8),
                   command=alert.destroy).pack(side='right')
 
         self.guardian_alert_window = alert
 
-        def _countdown(n):
-            if alert.winfo_exists():
-                if n > 0:
-                    countdown_lbl.config(text=f"Closing in {n}s")
-                    alert.after(1000, lambda: _countdown(n - 1))
-                else:
-                    alert.destroy()
+        if tier == 'warn':
+            def _countdown(n):
+                if alert.winfo_exists():
+                    if n > 0:
+                        countdown_lbl.config(text=f"Closing in {n}s")
+                        alert.after(1000, lambda: _countdown(n - 1))
+                    else:
+                        alert.destroy()
+            alert.after(1000, lambda: _countdown(14))
 
-        alert.after(1000, lambda: _countdown(9))
+    def update_alert_hogs(self, groups, action_msg=None):
+        """Fill the open alert with grouped hog totals and the action taken."""
+        alert = self.guardian_alert_window
+        if not (alert and alert.winfo_exists()):
+            return
+        if hasattr(self, 'guardian_alert_hogs') and self.guardian_alert_hogs.winfo_exists():
+            lines = []
+            for g in groups:
+                gb = g['rss'] / (1024 ** 3)
+                count = f" x{g['count']}" if g['count'] > 1 else ""
+                lines.append(f"  {g['name'][:22]:<22} {gb:5.1f} GB{count}")
+            self.guardian_alert_hogs.config(text="\n".join(lines) or "  (no data)")
+        if action_msg and hasattr(self, 'guardian_alert_action') \
+                and self.guardian_alert_action.winfo_exists():
+            self.guardian_alert_action.config(text=f"Action: {action_msg}")
 
     def create_guardian_tab(self, parent):
         """Create the RAM Guardian tab in the detailed view."""
@@ -1783,39 +1861,54 @@ Created with Python and psutil
                        activebackground=bg, activeforeground=fg,
                        command=self._toggle_guardian).pack(side='right')
 
-        # ── Threshold ──
-        thresh_frame = tk.Frame(parent, bg=bg)
-        thresh_frame.pack(fill='x', padx=12, pady=2)
+        # ── Escalation thresholds ──
+        cfg = self.guardian.config
+        self.guardian_thresh_vars = {}
+        for key, label, lo, hi in (('warn_pct', 'Warn (alert)', 50, 90),
+                                   ('act_pct', 'Suspend hog', 60, 95),
+                                   ('crit_pct', 'Kill hog', 70, 98)):
+            row = tk.Frame(parent, bg=bg)
+            row.pack(fill='x', padx=12, pady=0)
+            tk.Label(row, text=f"{label}:", bg=bg, fg=fg,
+                     font=('Arial', 8), width=12, anchor='w').pack(side='left')
+            var = tk.DoubleVar(value=getattr(cfg, key))
+            self.guardian_thresh_vars[key] = var
+            tk.Scale(row, from_=lo, to=hi, resolution=1,
+                     orient='horizontal', variable=var,
+                     bg=bg, fg=fg, highlightthickness=0,
+                     troughcolor=self.colors['button'],
+                     command=lambda v, k=key: self._update_guardian_threshold(k, v)
+                     ).pack(side='left', fill='x', expand=True, padx=6)
 
-        tk.Label(thresh_frame, text="Trigger at:", bg=bg, fg=fg,
-                 font=('Arial', 9)).pack(side='left')
-        self.guardian_thresh_lbl = tk.Label(thresh_frame, text=f"{self.guardian.threshold:.0f}%",
-                                            bg=bg, fg=self.colors['accent'],
-                                            font=('Arial', 9, 'bold'), width=5)
-        self.guardian_thresh_lbl.pack(side='right')
-        self.guardian_thresh_var = tk.DoubleVar(value=self.guardian.threshold)
-        tk.Scale(thresh_frame, from_=50, to=95, resolution=5,
-                 orient='horizontal', variable=self.guardian_thresh_var,
-                 bg=bg, fg=fg, highlightthickness=0,
-                 troughcolor=self.colors['button'],
-                 command=self._update_guardian_threshold
-                 ).pack(side='left', fill='x', expand=True, padx=6)
-
-        # ── Action ──
+        # ── Mode ──
         act_frame = tk.Frame(parent, bg=bg)
         act_frame.pack(fill='x', padx=12, pady=2)
 
-        tk.Label(act_frame, text="When triggered:", bg=bg, fg=fg,
+        tk.Label(act_frame, text="Mode:", bg=bg, fg=fg,
                  font=('Arial', 9)).pack(side='left')
-        self.guardian_action_var = tk.StringVar(value=self.guardian.action)
-        for val, lbl in [('warn', 'Alert only'), ('suspend', 'Suspend top hog'), ('kill', 'Kill top hog')]:
+        self.guardian_mode_var = tk.StringVar(value=cfg.mode)
+        for val, lbl in [('escalate', 'Escalating auto-action'), ('alert_only', 'Alert only')]:
             tk.Radiobutton(act_frame, text=lbl, value=val,
-                           variable=self.guardian_action_var,
+                           variable=self.guardian_mode_var,
                            bg=bg, fg=fg, selectcolor=self.colors['button'],
                            activebackground=bg, activeforeground=fg,
-                           command=lambda: setattr(self.guardian, 'action',
-                                                   self.guardian_action_var.get())
+                           command=self._update_guardian_mode
                            ).pack(side='left', padx=4)
+
+        # ── Extra protected processes ──
+        prot_frame = tk.Frame(parent, bg=bg)
+        prot_frame.pack(fill='x', padx=12, pady=2)
+        tk.Label(prot_frame, text="Never touch:", bg=bg, fg=fg,
+                 font=('Arial', 8)).pack(side='left')
+        self.guardian_protected_var = tk.StringVar(
+            value=", ".join(cfg.user_protected))
+        tk.Entry(prot_frame, textvariable=self.guardian_protected_var,
+                 bg=self.colors['button'], fg=fg,
+                 insertbackground=fg, font=('Consolas', 8)
+                 ).pack(side='left', fill='x', expand=True, padx=6)
+        tk.Button(prot_frame, text="Save", bg=self.colors['button'], fg=fg,
+                  font=('Arial', 8), relief='flat',
+                  command=self._save_guardian_protected).pack(side='right')
 
         # ── Current RAM status ──
         ram_row = tk.Frame(parent, bg=bg)
@@ -1878,36 +1971,65 @@ Created with Python and psutil
         state = "enabled" if self.guardian.enabled else "disabled"
         self.guardian.log_event('info', f"Guardian {state} by user")
 
-    def _update_guardian_threshold(self, val):
-        v = float(val)
-        self.guardian.threshold = v
-        self.guardian.warn_threshold = v - 5
-        if hasattr(self, 'guardian_thresh_lbl'):
-            self.guardian_thresh_lbl.config(text=f"{v:.0f}%")
+    def _update_guardian_threshold(self, key, val):
+        setattr(self.guardian.config, key, float(val))
+        self.guardian.save_config()
+
+    def _update_guardian_mode(self):
+        self.guardian.config.mode = self.guardian_mode_var.get()
+        self.guardian.save_config()
+        self.guardian.log_event('info', f"Mode: {self.guardian.config.mode}")
+
+    def _save_guardian_protected(self):
+        raw = self.guardian_protected_var.get()
+        names = [n.strip() for n in raw.split(',') if n.strip()]
+        self.guardian.config.user_protected = names
+        self.guardian.save_config()
+        self.guardian.log_event('info', f"Protected list: {len(names)} extra names")
+
+    def _select_top_target(self):
+        """Fast snapshot -> top eligible target. Returns (target, groups) or (None, groups)."""
+        procs = enrich_chromium(fast_memory_snapshot())
+        targets = select_targets(
+            procs, self.guardian.config.protected_names(),
+            suspended_pids=set(self.guardian.suspended), self_pid=os.getpid())
+        return (targets[0] if targets else None), group_by_name(procs)[:6]
 
     def _kill_top_hog_now(self):
-        """Scan for top hog then offer to kill it."""
-        if hasattr(self, 'guardian_ram_lbl'):
-            self.guardian_ram_lbl.config(text="Scanning...", fg=self.colors['warning'])
+        """Snapshot, confirm, kill the top hog."""
+        def _worker():
+            target, groups = self._select_top_target()
+            def _confirm():
+                self.update_alert_hogs(groups)
+                if not target:
+                    messagebox.showinfo("Guardian", "No killable processes found.")
+                    return
+                name, pid, gb = target['name'], target['pid'], target['rss'] / (1024 ** 3)
+                if messagebox.askyesno("Kill Process",
+                                       f"Kill '{name}' (PID {pid}, {gb:.1f} GB)?"):
+                    if self.process_manager.kill_process(pid):
+                        self.guardian.log_event('action', f"Manual kill: {name} (PID {pid})")
+                    else:
+                        messagebox.showerror("Guardian",
+                                             f"Could not kill '{name}' — may need admin rights.")
+            self.root.after(0, _confirm)
+        threading.Thread(target=_worker, daemon=True, name='ByteDogManualKill').start()
 
-        def _after_scan(processes):
-            hogs = self.guardian.get_top_hogs(processes, n=1)
-            if not hogs:
-                messagebox.showinfo("Guardian", "No killable processes found.")
-                return
-            top = hogs[0]
-            name = top.get('name', 'unknown')
-            pid = top.get('pid')
-            pct = top.get('memory_percent', 0)
-            if messagebox.askyesno("Kill Process",
-                                   f"Kill '{name}' (PID {pid}, {pct:.1f}% RAM)?"):
-                if self.process_manager.kill_process(pid):
-                    self.guardian.log_event('action', f"Manual kill: {name} (PID {pid})")
+    def _suspend_top_hog_now(self):
+        """Snapshot and suspend the top hog (no confirm — it's reversible)."""
+        def _worker():
+            target, groups = self._select_top_target()
+            msg = None
+            if target:
+                pid, name = target['pid'], target['name']
+                if self.process_manager.suspend_process(pid):
+                    self.guardian.suspended[pid] = name
+                    msg = f"Suspended {name} (PID {pid}) — use Resume All to undo"
+                    self.guardian.log_event('action', msg)
                 else:
-                    messagebox.showerror("Guardian",
-                                         f"Could not kill '{name}' — may need admin rights.")
-
-        self.trigger_process_scan(callback=_after_scan)
+                    msg = f"Could not suspend {name} (PID {pid})"
+            self.root.after(0, lambda: self.update_alert_hogs(groups, msg))
+        threading.Thread(target=_worker, daemon=True, name='ByteDogManualSuspend').start()
 
     def update_guardian_tab(self):
         """Refresh guardian tab — RAM instantly, process hogs from cache only."""
@@ -1918,12 +2040,12 @@ Created with Python and psutil
         ram_pct = mem['percent']
         used_gb = mem['used'] / (1024 ** 3)
         total_gb = mem['total'] / (1024 ** 3)
-        thresh = self.guardian.threshold
+        cfg = self.guardian.config
 
         # RAM label (instant)
-        if ram_pct >= thresh:
+        if ram_pct >= cfg.act_pct:
             r_color = self.colors['error']
-        elif ram_pct >= thresh - 5:
+        elif ram_pct >= cfg.warn_pct:
             r_color = self.colors['warning']
         else:
             r_color = self.colors['success']
@@ -2019,6 +2141,10 @@ def main():
         print("✅ GPU monitoring available")
     else:
         print("⚠️  GPU monitoring not available (install: pip install gputil)")
+
+    # Survive the thrash we're fighting: HIGH priority + pinned working set
+    for result in harden_self():
+        print(f"Guardian hardening: {result}")
 
     app = ByteDogApp()
     app.run()
