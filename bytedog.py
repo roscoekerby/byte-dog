@@ -34,6 +34,15 @@ try:
 except ImportError:
     GPU_AVAILABLE = False
 
+# GPUtil spawns nvidia-smi via Popen with no creationflags; under pythonw
+# (no parent console) that pops a visible console window on every poll.
+if GPU_AVAILABLE and platform.system() == 'Windows':
+    import functools
+    import GPUtil.GPUtil as _gputil_impl
+
+    _gputil_impl.Popen = functools.partial(
+        subprocess.Popen, creationflags=subprocess.CREATE_NO_WINDOW)
+
 # Hide console window on Windows when running as EXE
 if platform.system() == 'Windows' and getattr(sys, 'frozen', False):
     import ctypes
