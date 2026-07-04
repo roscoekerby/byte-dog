@@ -54,6 +54,7 @@ class SystemMonitor:
         self.update_interval = 2.0
         self.process_cache = []
         self.last_process_update = 0
+        self._total_ram = psutil.virtual_memory().total
 
     def get_cpu_usage(self):
         """Get current CPU usage percentage"""
@@ -126,22 +127,48 @@ class SystemMonitor:
         return None
 
     def get_process_list(self, use_cache=False):
-        """Get list of running processes with details"""
-        # Use cache if requested and cache is fresh
-        if use_cache and self.process_cache and (time.time() - self.last_process_update < 2):
+        """Get list of running processes — pid+name only (fast).
+        memory_percent and status are NOT fetched here; they take 4-17s on
+        machines with security software intercepting handle opens.
+        Call get_process_memory() separately, on demand."""
+        if use_cache and self.process_cache and (time.time() - self.last_process_update < 30):
             return self.process_cache
 
         processes = []
-        for proc in psutil.process_iter(['pid', 'name', 'memory_percent', 'status']):
+        for proc in psutil.process_iter(['pid', 'name'], ad_value=None):
             try:
                 pinfo = proc.info
-                # Don't calculate CPU percent here - it's too slow
+                if pinfo.get('name') is None:
+                    continue
                 pinfo['cpu_percent'] = 0.0
+                pinfo['memory_percent'] = 0.0
+                pinfo['memory_bytes'] = 0
+                pinfo['status'] = '—'
                 processes.append(pinfo)
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
                 continue
 
-        self.process_cache = sorted(processes, key=lambda x: x['memory_percent'] or 0, reverse=True)
+        self.process_cache = processes  # unsorted until memory scan runs
+        self.last_process_update = time.time()
+        return self.process_cache
+
+    def scan_process_memory(self):
+        """Fetch memory_percent for all cached processes.
+        Slow (~4s on restricted machines). Call in a background thread only."""
+        total = self._total_ram
+        enriched = []
+        for proc in psutil.process_iter(['pid', 'name', 'memory_percent'], ad_value=0):
+            try:
+                pinfo = proc.info
+                if pinfo.get('name') is None:
+                    continue
+                pinfo['cpu_percent'] = 0.0
+                pinfo['memory_bytes'] = int((pinfo.get('memory_percent') or 0) / 100.0 * total)
+                pinfo['status'] = '—'
+                enriched.append(pinfo)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+                continue
+        self.process_cache = sorted(enriched, key=lambda x: x.get('memory_percent') or 0, reverse=True)
         self.last_process_update = time.time()
         return self.process_cache
 
@@ -181,6 +208,129 @@ class ProcessManager:
             return True
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             return False
+
+
+class RAMGuardian:
+    """Proactive RAM pressure monitor — detects hogs, leaks, and prevents OOM crashes."""
+
+    # Processes that must never be auto-killed or suspended
+    PROTECTED = {
+        'system', 'svchost.exe', 'csrss.exe', 'wininit.exe', 'winlogon.exe',
+        'lsass.exe', 'services.exe', 'smss.exe', 'explorer.exe', 'dwm.exe',
+        'registry', 'idle', 'memory compression', 'memcompression',
+        'python.exe', 'pythonw.exe', 'bytedog.exe', 'msmpeng.exe',
+        'audiodg.exe', 'taskhostw.exe', 'runtimebroker.exe',
+        'fontdrvhost.exe', 'spoolsv.exe', 'ntoskrnl.exe', 'vmmem',
+    }
+
+    def __init__(self, threshold=80.0):
+        self.threshold = threshold           # % RAM to trigger action
+        self.warn_threshold = threshold - 5  # % RAM for early warning
+        self.action = 'warn'                 # 'warn', 'suspend', 'kill'
+        self.enabled = True
+        self.event_log = deque(maxlen=100)
+        self.last_action_time = 0
+        self.action_cooldown = 30            # seconds between auto-actions
+        self.process_memory_history = {}     # pid -> deque of (timestamp, rss_bytes)
+        self._lock = threading.Lock()
+        self.total_ram = psutil.virtual_memory().total
+
+    def log_event(self, level, message):
+        """Record an event. level: 'info', 'warn', 'critical', 'action'"""
+        entry = {
+            'time': datetime.now().strftime('%H:%M:%S'),
+            'level': level,
+            'message': message,
+        }
+        with self._lock:
+            self.event_log.appendleft(entry)
+        return entry
+
+    def get_top_hogs(self, processes, n=5):
+        """Top N non-protected processes by memory %"""
+        unprotected = [
+            p for p in processes
+            if p.get('name', '').lower() not in self.PROTECTED
+            and (p.get('memory_percent') or 0) > 0.05
+        ]
+        return sorted(unprotected, key=lambda x: x.get('memory_percent') or 0, reverse=True)[:n]
+
+    def track_memory_growth(self, processes):
+        """Track per-process RSS over time for leak detection"""
+        now = time.time()
+        for p in processes:
+            pid = p.get('pid')
+            rss = p.get('memory_bytes', 0)
+            if not pid or not rss:
+                continue
+            if pid not in self.process_memory_history:
+                self.process_memory_history[pid] = deque(maxlen=30)
+            self.process_memory_history[pid].append((now, rss))
+        # Remove dead processes
+        alive = {p.get('pid') for p in processes}
+        for dead in list(self.process_memory_history):
+            if dead not in alive:
+                del self.process_memory_history[dead]
+
+    def get_leak_suspects(self, processes):
+        """Return processes growing faster than 50 MB/min"""
+        suspects = []
+        for p in processes:
+            pid = p.get('pid')
+            if not pid or pid not in self.process_memory_history:
+                continue
+            hist = list(self.process_memory_history[pid])
+            if len(hist) < 4:
+                continue
+            t0, m0 = hist[0]
+            t1, m1 = hist[-1]
+            elapsed = t1 - t0
+            if elapsed < 10:
+                continue
+            growth_mb_min = ((m1 - m0) / elapsed * 60) / (1024 * 1024)
+            if growth_mb_min > 50:
+                suspects.append({**p, 'growth_mb_min': growth_mb_min})
+        return sorted(suspects, key=lambda x: x['growth_mb_min'], reverse=True)
+
+    def check_ram(self, mem_info):
+        """Check RAM pressure using only virtual_memory() — instant, no process scanning."""
+        if not self.enabled:
+            return None
+        ram_pct = mem_info['percent']
+        now = time.time()
+        if (now - self.last_action_time) < self.action_cooldown:
+            return None
+
+        used_gb = mem_info['used'] / (1024 ** 3)
+        total_gb = mem_info['total'] / (1024 ** 3)
+
+        if ram_pct >= self.threshold:
+            msg = f"RAM {ram_pct:.1f}% ({used_gb:.1f}/{total_gb:.0f} GB) — threshold exceeded"
+            event = self.log_event('critical', msg)
+            self.last_action_time = now
+            return {
+                'type': 'critical',
+                'ram_pct': ram_pct,
+                'used_gb': used_gb,
+                'total_gb': total_gb,
+                'hogs': [],           # filled in async by handle_guardian_event
+                'action_needed': self.action,
+                'event': event,
+            }
+        elif ram_pct >= self.warn_threshold:
+            msg = f"RAM warning {ram_pct:.1f}% ({used_gb:.1f}/{total_gb:.0f} GB)"
+            event = self.log_event('warn', msg)
+            self.last_action_time = now
+            return {
+                'type': 'warn',
+                'ram_pct': ram_pct,
+                'used_gb': used_gb,
+                'total_gb': total_gb,
+                'hogs': [],
+                'action_needed': 'warn',
+                'event': event,
+            }
+        return None
 
 
 class MinimalView(tk.Toplevel):
@@ -283,6 +433,9 @@ class ByteDogApp:
 
         self.monitor = SystemMonitor()
         self.process_manager = ProcessManager()
+        self.guardian = RAMGuardian(threshold=80.0)
+        self.guardian_queue = queue.Queue()
+        self.guardian_alert_window = None
 
         # Initialize CPU percent to prevent blocking
         psutil.cpu_percent(interval=None)
@@ -478,6 +631,12 @@ class ByteDogApp:
         self.status_label = ttk.Label(status_frame, text="Ready")
         self.status_label.pack(side=tk.LEFT, padx=(10, 0))
 
+        # Guardian status badge (right side)
+        self.guardian_compact_label = tk.Label(status_frame, text="Shield: --",
+                                               bg=self.colors['bg'], fg=self.colors['success'],
+                                               font=('Consolas', 8))
+        self.guardian_compact_label.pack(side=tk.RIGHT, padx=(5, 0))
+
         # System overview frame
         overview_frame = ttk.Frame(self.compact_frame)
         overview_frame.pack(fill='x', pady=10)
@@ -552,6 +711,11 @@ class ByteDogApp:
         notebook.add(network_tab, text='Network')
         self.create_network_tab(network_tab)
 
+        # Guardian tab
+        guardian_tab = ttk.Frame(notebook)
+        notebook.add(guardian_tab, text='Guardian')
+        self.create_guardian_tab(guardian_tab)
+
     def create_menu(self):
         """Create menu bar"""
         menubar = tk.Menu(self.root, bg=self.colors['button'], fg=self.colors['fg'])
@@ -577,6 +741,8 @@ class ByteDogApp:
         menubar.add_cascade(label="Tools", menu=tools_menu)
         tools_menu.add_command(label="Settings", command=self.show_settings)
         tools_menu.add_command(label="Performance Report", command=self.generate_report)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Toggle RAM Guardian", command=self._menu_toggle_guardian)
 
         # Help menu
         help_menu = tk.Menu(menubar, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
@@ -622,7 +788,7 @@ class ByteDogApp:
             # Compact mode - essential info with window decorations
             self.root.overrideredirect(False)
             self.compact_frame.pack(fill='both', expand=True)
-            self.root.geometry("340x320")
+            self.root.geometry("340x345")
             if hasattr(self, 'toggle_btn'):
                 self.toggle_btn.config(text="▼")
             if hasattr(self, 'menubar'):
@@ -637,6 +803,8 @@ class ByteDogApp:
                 self.detailed_toggle_btn.config(text="▲")
             if hasattr(self, 'menubar'):
                 self.root.config(menu=self.menubar)  # restore menubar
+            # Restart guardian tab refresh loop
+            self.root.after(200, self.update_guardian_tab)
 
     def create_metric_card(self, parent, title, value, unit):
         """Create a metric display card"""
@@ -851,10 +1019,14 @@ class ByteDogApp:
             self.update_process_list()
 
     def refresh_processes(self):
-        """Force refresh process list"""
-        self.monitor.process_cache = []
-        if hasattr(self, 'process_tree'):
+        """Trigger async process memory scan then refresh the list."""
+        if hasattr(self, 'status_label'):
+            self.status_label.config(text="Scanning processes...", fg=self.colors['warning'])
+        def _done(procs):
             self.update_process_list()
+            if hasattr(self, 'status_label'):
+                self.status_label.config(text=f"Found {len(procs)} processes", fg=self.colors['success'])
+        self.trigger_process_scan(callback=_done)
 
     def show_process_menu(self, event):
         """Show context menu for process"""
@@ -979,19 +1151,27 @@ class ByteDogApp:
 
         processes = self.monitor.get_process_list(use_cache=True)
 
-        # Clear and update
         self.process_display.config(state='normal')
         self.process_display.delete(1.0, tk.END)
 
-        text = "TOP PROCESSES (by Memory)\n"
-        text += "-" * 30 + "\n"
+        has_memory = any(p.get('memory_percent', 0) > 0 for p in processes)
 
-        for i, proc in enumerate(processes[:8]):  # Top 8 processes
-            name = proc['name'][:15] if len(proc['name']) > 15 else proc['name']
-            mem_pct = proc.get('memory_percent', 0)
-            text += f"{name:<15} {mem_pct:>6.1f}%\n"
+        if not processes:
+            self.process_display.insert(1.0, "  Click Refresh to scan processes")
+        elif not has_memory:
+            self.process_display.insert(1.0, "TOP PROCESSES (click Refresh for memory)\n")
+            self.process_display.insert(tk.END, "-" * 30 + "\n")
+            for proc in processes[:8]:
+                name = proc['name'][:28]
+                self.process_display.insert(tk.END, f"  {name}\n")
+        else:
+            self.process_display.insert(1.0, "TOP PROCESSES (by Memory)\n")
+            self.process_display.insert(tk.END, "-" * 30 + "\n")
+            for proc in processes[:8]:
+                name = proc['name'][:15]
+                mem_pct = proc.get('memory_percent', 0)
+                self.process_display.insert(tk.END, f"{name:<15} {mem_pct:>6.1f}%\n")
 
-        self.process_display.insert(1.0, text)
         self.process_display.config(state='disabled')
 
     def update_metrics(self):
@@ -1046,6 +1226,24 @@ class ByteDogApp:
                     self.status_canvas.itemconfig(self.status_indicator,
                                                   fill=status_colors.get(overall_status, 'gray'))
                     self.status_label.config(text=f"Status: {overall_status.title()}")
+
+                # Update guardian compact badge
+                if hasattr(self, 'guardian_compact_label'):
+                    ram_pct = mem['percent']
+                    thresh = self.guardian.threshold
+                    if not self.guardian.enabled:
+                        g_text = "Shield: OFF"
+                        g_color = '#666666'
+                    elif ram_pct >= thresh:
+                        g_text = f"Shield: {ram_pct:.0f}%!! ALERT"
+                        g_color = self.colors['error']
+                    elif ram_pct >= thresh - 5:
+                        g_text = f"Shield: {ram_pct:.0f}% WARN"
+                        g_color = self.colors['warning']
+                    else:
+                        g_text = f"Shield: {ram_pct:.0f}/{thresh:.0f}% OK"
+                        g_color = self.colors['success']
+                    self.guardian_compact_label.config(text=g_text, fg=g_color)
 
             # Update detailed view
             elif self.view_mode.get() == "detailed":
@@ -1204,30 +1402,39 @@ class ByteDogApp:
             self.root.after(2000, self.update_network_info)
 
     def start_monitoring(self):
-        """Start the monitoring thread"""
+        """Start the fast monitoring thread — CPU and RAM only, never blocks."""
 
-        def monitor_loop():
+        def fast_loop():
             while True:
                 try:
-                    # Collect data in background
                     data = {
                         'cpu': self.monitor.get_cpu_usage(),
                         'memory': self.monitor.get_memory_info(),
-                        'processes': self.monitor.get_process_list(use_cache=False)
                     }
-
                     if GPU_AVAILABLE:
                         data['gpu'] = self.monitor.get_gpu_info()
-
-                    # Queue data for UI update
                     self.data_queue.put(data)
+
+                    # Guardian: RAM% check only — instant, no process scanning
+                    g_event = self.guardian.check_ram(data['memory'])
+                    if g_event:
+                        self.guardian_queue.put(g_event)
                 except Exception as e:
                     print(f"Monitoring error: {e}")
-
                 time.sleep(self.monitor.update_interval)
 
-        monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-        monitor_thread.start()
+        threading.Thread(target=fast_loop, daemon=True, name='ByteDogFast').start()
+
+    def trigger_process_scan(self, callback=None):
+        """Run a process memory scan in background. Calls callback(processes) when done."""
+        def _scan():
+            try:
+                procs = self.monitor.scan_process_memory()
+                if callback:
+                    self.root.after(0, lambda: callback(procs))
+            except Exception as e:
+                print(f"Process scan error: {e}")
+        threading.Thread(target=_scan, daemon=True, name='ByteDogScan').start()
 
     def process_queue(self):
         """Process data from monitoring thread"""
@@ -1236,6 +1443,14 @@ class ByteDogApp:
                 data = self.data_queue.get_nowait()
                 # Update metrics based on current view
                 self.update_metrics()
+        except queue.Empty:
+            pass
+
+        # Process guardian events
+        try:
+            while True:
+                g_event = self.guardian_queue.get_nowait()
+                self.handle_guardian_event(g_event)
         except queue.Empty:
             pass
 
@@ -1433,6 +1648,339 @@ Created with Python and psutil
                 return f"{bytes_val:.2f} {unit}"
             bytes_val /= 1024.0
         return f"{bytes_val:.2f} PB"
+
+    # ── RAM Guardian methods ────────────────────────────────────────────────
+
+    def _menu_toggle_guardian(self):
+        """Toggle guardian on/off from menu"""
+        self.guardian.enabled = not self.guardian.enabled
+        state = "enabled" if self.guardian.enabled else "disabled"
+        self.guardian.log_event('info', f"Guardian {state} by user")
+        if hasattr(self, 'status_label'):
+            self.status_label.config(text=f"Guardian {state}")
+
+    def handle_guardian_event(self, event):
+        """Show guardian alert immediately, then scan for hogs in background."""
+        # Show alert right away with RAM info — no process scan needed yet
+        self.show_guardian_alert(event)
+
+        # If action is suspend/kill, scan for top hog async then act
+        if event['type'] == 'critical' and event['action_needed'] in ('kill', 'suspend'):
+            def _after_scan(processes):
+                hogs = self.guardian.get_top_hogs(processes)
+                if not hogs:
+                    return
+                top = hogs[0]
+                pid, name = top.get('pid'), top.get('name', 'unknown')
+                action = event['action_needed']
+                if action == 'kill' and pid and self.process_manager.kill_process(pid):
+                    self.guardian.log_event('action', f"Killed {name} (PID {pid})")
+                elif action == 'suspend' and pid and self.process_manager.suspend_process(pid):
+                    self.guardian.log_event('action', f"Suspended {name} (PID {pid})")
+            self.trigger_process_scan(callback=_after_scan)
+
+    def show_guardian_alert(self, event, auto_action=None):
+        """Non-blocking, auto-closing alert window for guardian events."""
+        # Don't stack alerts
+        if self.guardian_alert_window and self.guardian_alert_window.winfo_exists():
+            return
+
+        alert = tk.Toplevel(self.root)
+        alert.title("ByteDog Guardian")
+        alert.attributes('-topmost', True)
+        alert.configure(bg='#1a1a1a')
+        alert.resizable(False, False)
+
+        # Position top-right corner
+        screen_w = alert.winfo_screenwidth()
+        alert.geometry(f"330x230+{screen_w - 350}+80")
+
+        is_critical = event['type'] == 'critical'
+        hdr_color = '#f44336' if is_critical else '#ff9800'
+        icon = '!! CRITICAL' if is_critical else '! WARNING'
+
+        # Header
+        hdr = tk.Frame(alert, bg=hdr_color)
+        hdr.pack(fill='x')
+        tk.Label(hdr, text=f"  RAM GUARDIAN {icon}",
+                 bg=hdr_color, fg='white', font=('Arial', 11, 'bold'),
+                 anchor='w').pack(fill='x', padx=8, pady=6)
+
+        body = tk.Frame(alert, bg='#1a1a1a')
+        body.pack(fill='both', expand=True, padx=10, pady=8)
+
+        # RAM bar
+        ram_pct = event['ram_pct']
+        used = event.get('used_gb', 0)
+        total = event.get('total_gb', 0)
+        tk.Label(body, text=f"RAM Usage: {ram_pct:.1f}%  ({used:.1f} / {total:.0f} GB)",
+                 bg='#1a1a1a', fg='white', font=('Arial', 10, 'bold')).pack(anchor='w')
+
+        # Canvas RAM bar
+        bar_frame = tk.Frame(body, bg='#1a1a1a')
+        bar_frame.pack(fill='x', pady=(2, 8))
+        bar_bg = tk.Canvas(bar_frame, height=8, bg='#333333', highlightthickness=0)
+        bar_bg.pack(fill='x')
+        bar_bg.update_idletasks()
+        bar_w = bar_bg.winfo_width() or 300
+        fill_w = int(bar_w * ram_pct / 100)
+        fill_color = '#f44336' if ram_pct >= self.guardian.threshold else '#ff9800'
+        bar_bg.create_rectangle(0, 0, fill_w, 8, fill=fill_color, outline='')
+
+        # Top hogs
+        tk.Label(body, text="Top memory users:",
+                 bg='#1a1a1a', fg='#aaaaaa', font=('Arial', 8)).pack(anchor='w')
+        for hog in event.get('hogs', [])[:4]:
+            name = hog.get('name', '?')[:24]
+            pct = hog.get('memory_percent', 0)
+            mb = hog.get('memory_bytes', 0) / (1024 * 1024)
+            tk.Label(body, text=f"  {name:<24}  {pct:.1f}%  ({mb:.0f} MB)",
+                     bg='#1a1a1a', fg='white', font=('Consolas', 8)).pack(anchor='w')
+
+        if auto_action:
+            tk.Label(body, text=f"  Action: {auto_action}",
+                     bg='#1a1a1a', fg='#4caf50', font=('Arial', 8, 'bold')).pack(anchor='w', pady=(4, 0))
+
+        # Footer: countdown + dismiss
+        footer = tk.Frame(alert, bg='#1a1a1a')
+        footer.pack(fill='x', padx=10, pady=(0, 8))
+
+        countdown_lbl = tk.Label(footer, text="Closing in 10s",
+                                  bg='#1a1a1a', fg='#555555', font=('Arial', 7))
+        countdown_lbl.pack(side='left')
+
+        tk.Button(footer, text="Dismiss", bg='#2d2d2d', fg='white',
+                  relief='flat', font=('Arial', 8),
+                  command=alert.destroy).pack(side='right')
+
+        self.guardian_alert_window = alert
+
+        def _countdown(n):
+            if alert.winfo_exists():
+                if n > 0:
+                    countdown_lbl.config(text=f"Closing in {n}s")
+                    alert.after(1000, lambda: _countdown(n - 1))
+                else:
+                    alert.destroy()
+
+        alert.after(1000, lambda: _countdown(9))
+
+    def create_guardian_tab(self, parent):
+        """Create the RAM Guardian tab in the detailed view."""
+        bg = self.colors['bg']
+        fg = self.colors['fg']
+
+        # ── Header ──
+        hdr = tk.Frame(parent, bg=bg)
+        hdr.pack(fill='x', padx=12, pady=(8, 4))
+
+        tk.Label(hdr, text="RAM Guardian", bg=bg, fg=fg,
+                 font=('Arial', 12, 'bold')).pack(side='left')
+
+        self.guardian_enabled_var = tk.BooleanVar(value=self.guardian.enabled)
+        tk.Checkbutton(hdr, text="Active", variable=self.guardian_enabled_var,
+                       bg=bg, fg=fg, selectcolor=self.colors['button'],
+                       activebackground=bg, activeforeground=fg,
+                       command=self._toggle_guardian).pack(side='right')
+
+        # ── Threshold ──
+        thresh_frame = tk.Frame(parent, bg=bg)
+        thresh_frame.pack(fill='x', padx=12, pady=2)
+
+        tk.Label(thresh_frame, text="Trigger at:", bg=bg, fg=fg,
+                 font=('Arial', 9)).pack(side='left')
+        self.guardian_thresh_lbl = tk.Label(thresh_frame, text=f"{self.guardian.threshold:.0f}%",
+                                            bg=bg, fg=self.colors['accent'],
+                                            font=('Arial', 9, 'bold'), width=5)
+        self.guardian_thresh_lbl.pack(side='right')
+        self.guardian_thresh_var = tk.DoubleVar(value=self.guardian.threshold)
+        tk.Scale(thresh_frame, from_=50, to=95, resolution=5,
+                 orient='horizontal', variable=self.guardian_thresh_var,
+                 bg=bg, fg=fg, highlightthickness=0,
+                 troughcolor=self.colors['button'],
+                 command=self._update_guardian_threshold
+                 ).pack(side='left', fill='x', expand=True, padx=6)
+
+        # ── Action ──
+        act_frame = tk.Frame(parent, bg=bg)
+        act_frame.pack(fill='x', padx=12, pady=2)
+
+        tk.Label(act_frame, text="When triggered:", bg=bg, fg=fg,
+                 font=('Arial', 9)).pack(side='left')
+        self.guardian_action_var = tk.StringVar(value=self.guardian.action)
+        for val, lbl in [('warn', 'Alert only'), ('suspend', 'Suspend top hog'), ('kill', 'Kill top hog')]:
+            tk.Radiobutton(act_frame, text=lbl, value=val,
+                           variable=self.guardian_action_var,
+                           bg=bg, fg=fg, selectcolor=self.colors['button'],
+                           activebackground=bg, activeforeground=fg,
+                           command=lambda: setattr(self.guardian, 'action',
+                                                   self.guardian_action_var.get())
+                           ).pack(side='left', padx=4)
+
+        # ── Current RAM status ──
+        ram_row = tk.Frame(parent, bg=bg)
+        ram_row.pack(fill='x', padx=12, pady=(6, 2))
+
+        tk.Label(ram_row, text="RAM now:", bg=bg, fg=fg, font=('Arial', 9)).pack(side='left')
+        self.guardian_ram_lbl = tk.Label(ram_row, text="--", bg=bg,
+                                         fg=self.colors['success'],
+                                         font=('Arial', 11, 'bold'))
+        self.guardian_ram_lbl.pack(side='left', padx=6)
+
+        # Manual kill button
+        tk.Button(ram_row, text="Kill Top Hog Now",
+                  bg='#5a1a1a', fg='white', font=('Arial', 8),
+                  relief='flat', command=self._kill_top_hog_now
+                  ).pack(side='right')
+
+        # ── Divider ──
+        tk.Frame(parent, height=1, bg=self.colors['select']).pack(fill='x', padx=12, pady=4)
+
+        # ── Split: hogs + event log ──
+        split = tk.Frame(parent, bg=bg)
+        split.pack(fill='both', expand=True, padx=12)
+
+        left = tk.Frame(split, bg=bg)
+        left.pack(side='left', fill='both', expand=True)
+
+        tk.Label(left, text="Top Memory Hogs", bg=bg, fg=fg,
+                 font=('Arial', 9, 'bold')).pack(anchor='w')
+        self.guardian_hogs_text = tk.Text(left, height=7, bg=self.colors['button'],
+                                          fg=fg, font=('Consolas', 8),
+                                          state='disabled', width=22, relief='flat')
+        self.guardian_hogs_text.pack(fill='both', expand=True, pady=2)
+
+        right = tk.Frame(split, bg=bg)
+        right.pack(side='right', fill='both', expand=True, padx=(6, 0))
+
+        tk.Label(right, text="Event Log", bg=bg, fg=fg,
+                 font=('Arial', 9, 'bold')).pack(anchor='w')
+        self.guardian_log_text = tk.Text(right, height=7, bg=self.colors['button'],
+                                         fg=fg, font=('Consolas', 7),
+                                         state='disabled', width=28, relief='flat')
+        self.guardian_log_text.pack(fill='both', expand=True, pady=2)
+
+        # ── Leak suspects ──
+        tk.Frame(parent, height=1, bg=self.colors['select']).pack(fill='x', padx=12, pady=(4, 2))
+        tk.Label(parent, text="Memory Leak Suspects  (growing >50 MB/min)",
+                 bg=bg, fg=self.colors['warning'],
+                 font=('Arial', 8, 'bold')).pack(anchor='w', padx=12)
+        self.guardian_leak_text = tk.Text(parent, height=3, bg=self.colors['button'],
+                                          fg=self.colors['warning'], font=('Consolas', 8),
+                                          state='disabled', relief='flat')
+        self.guardian_leak_text.pack(fill='x', padx=12, pady=(2, 6))
+
+        # Defer first update — don't block main thread during setup
+        self.root.after(2000, self.update_guardian_tab)
+
+    def _toggle_guardian(self):
+        self.guardian.enabled = self.guardian_enabled_var.get()
+        state = "enabled" if self.guardian.enabled else "disabled"
+        self.guardian.log_event('info', f"Guardian {state} by user")
+
+    def _update_guardian_threshold(self, val):
+        v = float(val)
+        self.guardian.threshold = v
+        self.guardian.warn_threshold = v - 5
+        if hasattr(self, 'guardian_thresh_lbl'):
+            self.guardian_thresh_lbl.config(text=f"{v:.0f}%")
+
+    def _kill_top_hog_now(self):
+        """Scan for top hog then offer to kill it."""
+        if hasattr(self, 'guardian_ram_lbl'):
+            self.guardian_ram_lbl.config(text="Scanning...", fg=self.colors['warning'])
+
+        def _after_scan(processes):
+            hogs = self.guardian.get_top_hogs(processes, n=1)
+            if not hogs:
+                messagebox.showinfo("Guardian", "No killable processes found.")
+                return
+            top = hogs[0]
+            name = top.get('name', 'unknown')
+            pid = top.get('pid')
+            pct = top.get('memory_percent', 0)
+            if messagebox.askyesno("Kill Process",
+                                   f"Kill '{name}' (PID {pid}, {pct:.1f}% RAM)?"):
+                if self.process_manager.kill_process(pid):
+                    self.guardian.log_event('action', f"Manual kill: {name} (PID {pid})")
+                else:
+                    messagebox.showerror("Guardian",
+                                         f"Could not kill '{name}' — may need admin rights.")
+
+        self.trigger_process_scan(callback=_after_scan)
+
+    def update_guardian_tab(self):
+        """Refresh guardian tab — RAM instantly, process hogs from cache only."""
+        if not hasattr(self, 'guardian_hogs_text'):
+            return
+
+        mem = self.monitor.get_memory_info()
+        ram_pct = mem['percent']
+        used_gb = mem['used'] / (1024 ** 3)
+        total_gb = mem['total'] / (1024 ** 3)
+        thresh = self.guardian.threshold
+
+        # RAM label (instant)
+        if ram_pct >= thresh:
+            r_color = self.colors['error']
+        elif ram_pct >= thresh - 5:
+            r_color = self.colors['warning']
+        else:
+            r_color = self.colors['success']
+        self.guardian_ram_lbl.config(
+            text=f"{ram_pct:.1f}%  ({used_gb:.1f} / {total_gb:.0f} GB)", fg=r_color)
+
+        # Top hogs — from cache only (no blocking scan)
+        processes = self.monitor.process_cache
+        has_memory = any(p.get('memory_percent', 0) > 0 for p in processes)
+
+        self.guardian_hogs_text.config(state='normal')
+        self.guardian_hogs_text.delete(1.0, tk.END)
+        if not has_memory:
+            self.guardian_hogs_text.insert(tk.END, "  Click 'Kill Top Hog Now'\n  to scan for hogs\n")
+        else:
+            hogs = self.guardian.get_top_hogs(processes, n=8)
+            for h in hogs:
+                mb = h.get('memory_bytes', 0) / (1024 * 1024)
+                pct = h.get('memory_percent', 0)
+                line = f"{h['name'][:18]:<18} {pct:4.1f}%  {mb:5.0f}MB\n"
+                self.guardian_hogs_text.insert(tk.END, line)
+        self.guardian_hogs_text.config(state='disabled')
+
+        # Event log (instant — reads from deque)
+        level_icons = {'info': ' ', 'warn': '!', 'critical': '!!', 'action': '>'}
+        level_colors = {'info': '#888888', 'warn': '#ff9800',
+                        'critical': '#f44336', 'action': '#4caf50'}
+        self.guardian_log_text.config(state='normal')
+        self.guardian_log_text.delete(1.0, tk.END)
+        with self.guardian._lock:
+            for entry in list(self.guardian.event_log)[:20]:
+                icon = level_icons.get(entry['level'], ' ')
+                line = f"{entry['time']} {icon} {entry['message'][:36]}\n"
+                tag = entry['level']
+                self.guardian_log_text.insert(tk.END, line, tag)
+                self.guardian_log_text.tag_config(
+                    tag, foreground=level_colors.get(entry['level'], '#888888'))
+        self.guardian_log_text.config(state='disabled')
+
+        # Leak suspects — only if cache has memory data
+        self.guardian_leak_text.config(state='normal')
+        self.guardian_leak_text.delete(1.0, tk.END)
+        if has_memory:
+            leaks = self.guardian.get_leak_suspects(processes)
+            if leaks:
+                for lk in leaks[:3]:
+                    name = lk.get('name', '?')[:20]
+                    rate = lk['growth_mb_min']
+                    self.guardian_leak_text.insert(tk.END, f"  {name:<22}  +{rate:.0f} MB/min\n")
+            else:
+                self.guardian_leak_text.insert(tk.END, "  No leaks detected\n")
+        else:
+            self.guardian_leak_text.insert(tk.END, "  Run a scan to detect leaks\n")
+        self.guardian_leak_text.config(state='disabled')
+
+        if self.view_mode.get() == 'detailed':
+            self.root.after(2000, self.update_guardian_tab)
 
     def run(self):
         """Start the application"""
