@@ -274,7 +274,7 @@ class RAMGuardian:
         now = time.time()
         for p in processes:
             pid = p.get('pid')
-            rss = p.get('memory_bytes', 0)
+            rss = p.get('rss') or p.get('memory_bytes') or 0
             if not pid or not rss:
                 continue
             if pid not in self.process_memory_history:
@@ -2061,21 +2061,22 @@ Created with Python and psutil
         self.guardian_ram_lbl.config(
             text=f"{ram_pct:.1f}%  ({used_gb:.1f} / {total_gb:.0f} GB)", fg=r_color)
 
-        # Top hogs — from cache only (no blocking scan)
-        processes = self.monitor.process_cache
-        has_memory = any(p.get('memory_percent', 0) > 0 for p in processes)
+        # Top hogs — live Norton-safe snapshot (~4ms), grouped per app
+        try:
+            snap = fast_memory_snapshot()
+        except Exception:
+            snap = []
 
         self.guardian_hogs_text.config(state='normal')
         self.guardian_hogs_text.delete(1.0, tk.END)
-        if not has_memory:
-            self.guardian_hogs_text.insert(tk.END, "  Click 'Kill Top Hog Now'\n  to scan for hogs\n")
+        if snap:
+            for g in group_by_name(snap)[:8]:
+                gb = g['rss'] / (1024 ** 3)
+                count = f" x{g['count']}" if g['count'] > 1 else ""
+                self.guardian_hogs_text.insert(
+                    tk.END, f"{g['name'][:15]:<15} {gb:5.2f}GB{count}\n")
         else:
-            hogs = self.guardian.get_top_hogs(processes, n=8)
-            for h in hogs:
-                mb = h.get('memory_bytes', 0) / (1024 * 1024)
-                pct = h.get('memory_percent', 0)
-                line = f"{h['name'][:18]:<18} {pct:4.1f}%  {mb:5.0f}MB\n"
-                self.guardian_hogs_text.insert(tk.END, line)
+            self.guardian_hogs_text.insert(tk.END, "  snapshot unavailable\n")
         self.guardian_hogs_text.config(state='disabled')
 
         # Event log (instant — reads from deque)
@@ -2094,20 +2095,22 @@ Created with Python and psutil
                     tag, foreground=level_colors.get(entry['level'], '#888888'))
         self.guardian_log_text.config(state='disabled')
 
-        # Leak suspects — only if cache has memory data
+        # Leak suspects — history accumulates from the live snapshots above
         self.guardian_leak_text.config(state='normal')
         self.guardian_leak_text.delete(1.0, tk.END)
-        if has_memory:
-            leaks = self.guardian.get_leak_suspects(processes)
+        if snap:
+            self.guardian.track_memory_growth(snap)
+            leaks = self.guardian.get_leak_suspects(snap)
             if leaks:
                 for lk in leaks[:3]:
                     name = lk.get('name', '?')[:20]
                     rate = lk['growth_mb_min']
                     self.guardian_leak_text.insert(tk.END, f"  {name:<22}  +{rate:.0f} MB/min\n")
             else:
-                self.guardian_leak_text.insert(tk.END, "  No leaks detected\n")
+                self.guardian_leak_text.insert(
+                    tk.END, f"  No leaks detected (watching {len(snap)} processes)\n")
         else:
-            self.guardian_leak_text.insert(tk.END, "  Run a scan to detect leaks\n")
+            self.guardian_leak_text.insert(tk.END, "  Snapshot unavailable\n")
         self.guardian_leak_text.config(state='disabled')
 
         if self.view_mode.get() == 'detailed':
