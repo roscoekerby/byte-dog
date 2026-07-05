@@ -1308,7 +1308,8 @@ class ByteDogApp:
         graph_height = 15
         graph_width = 60
 
-        # Clear text
+        # Redraw resets scroll to top; remember where the user was
+        scroll_pos = self.perf_text.yview()[0]
         self.perf_text.delete(1.0, tk.END)
 
         # CPU Graph
@@ -1328,6 +1329,9 @@ class ByteDogApp:
 
         # Configure text tags
         self.perf_text.tag_config('title', foreground=self.colors['accent'], font=('Arial', 11, 'bold'))
+
+        # Restore scroll position (content length is stable across redraws)
+        self.perf_text.yview_moveto(scroll_pos)
 
         # Schedule next update
         if self.view_mode.get() == 'detailed':
