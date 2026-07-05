@@ -806,8 +806,9 @@ class ByteDogApp:
                 self.detailed_toggle_btn.config(text="▲")
             if hasattr(self, 'menubar'):
                 self.root.config(menu=self.menubar)  # restore menubar
-            # Restart guardian tab refresh loop
+            # Restart guardian tab and performance graph refresh loops
             self.root.after(200, self.update_guardian_tab)
+            self.root.after(200, self.update_performance_graph)
 
     def create_metric_card(self, parent, title, value, unit):
         """Create a metric display card"""
@@ -1186,6 +1187,13 @@ class ByteDogApp:
             mem = self.monitor.get_memory_info()
             gpu_info = self.monitor.get_gpu_info() if GPU_AVAILABLE else None
 
+            # Accumulate history in every view mode so the Performance tab
+            # is already populated when opened
+            self.monitor.cpu_history.append(cpu)
+            self.monitor.ram_history.append(mem['percent'])
+            if gpu_info and self.monitor.gpu_history is not None:
+                self.monitor.gpu_history.append(gpu_info['load'])
+
             # Update minimal view
             if self.view_mode.get() == "minimal":
                 # Update minimal display
@@ -1291,21 +1299,10 @@ class ByteDogApp:
             return 'poor'
 
     def update_performance_graph(self):
-        """Update performance history graph"""
+        """Render performance history graphs (history accumulates in
+        update_metrics; this only draws)."""
         if not hasattr(self, 'perf_text'):
             return
-
-        # Add current values to history
-        cpu = self.monitor.get_cpu_usage()
-        mem = self.monitor.get_memory_info()
-
-        self.monitor.cpu_history.append(cpu)
-        self.monitor.ram_history.append(mem['percent'])
-
-        if GPU_AVAILABLE:
-            gpu_info = self.monitor.get_gpu_info()
-            if gpu_info and self.monitor.gpu_history is not None:
-                self.monitor.gpu_history.append(gpu_info['load'])
 
         # Create text-based graph
         graph_height = 15
