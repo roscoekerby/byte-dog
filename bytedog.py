@@ -49,6 +49,17 @@ if platform.system() == 'Windows' and getattr(sys, 'frozen', False):
 
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
+# Without an explicit AppUserModelID, Windows groups the window under the
+# python.exe host process and shows the Python icon in the taskbar.
+if platform.system() == 'Windows':
+    import ctypes
+
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            'ROSCODETech.ByteDog')
+    except Exception:
+        pass
+
 
 def resource_path(name: str) -> str:
     """
