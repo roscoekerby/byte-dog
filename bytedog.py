@@ -16,7 +16,6 @@ import os
 import json
 from datetime import datetime, timedelta
 from collections import deque
-import subprocess
 import sys
 import queue
 
@@ -26,22 +25,11 @@ from guardian import (
     harden_self, install_autostart, uninstall_autostart, autostart_installed,
 )
 
-# Try to import optional dependencies
-try:
-    import GPUtil
+# GPU backend: NVML via nvidia-ml-py + PDH per-process VRAM (both in-process,
+# no subprocess — safe under pythonw, no console flashes)
+import gpu as gpu_backend
 
-    GPU_AVAILABLE = True
-except ImportError:
-    GPU_AVAILABLE = False
-
-# GPUtil spawns nvidia-smi via Popen with no creationflags; under pythonw
-# (no parent console) that pops a visible console window on every poll.
-if GPU_AVAILABLE and platform.system() == 'Windows':
-    import functools
-    import GPUtil.GPUtil as _gputil_impl
-
-    _gputil_impl.Popen = functools.partial(
-        subprocess.Popen, creationflags=subprocess.CREATE_NO_WINDOW)
+GPU_AVAILABLE = gpu_backend.gpu_available()
 
 # Hide console window on Windows when running as EXE
 if platform.system() == 'Windows' and getattr(sys, 'frozen', False):
@@ -135,22 +123,7 @@ class SystemMonitor:
         """Get GPU usage information if available"""
         if not GPU_AVAILABLE:
             return None
-
-        try:
-            gpus = GPUtil.getGPUs()
-            if gpus:
-                gpu = gpus[0]
-                return {
-                    'name': gpu.name,
-                    'load': gpu.load * 100,
-                    'memory_used': gpu.memoryUsed,
-                    'memory_total': gpu.memoryTotal,
-                    'memory_percent': (gpu.memoryUsed / gpu.memoryTotal) * 100 if gpu.memoryTotal > 0 else 0,
-                    'temperature': gpu.temperature
-                }
-        except:
-            pass
-        return None
+        return gpu_backend.get_gpu_info()
 
     def get_process_list(self, use_cache=False):
         """Get list of running processes — pid+name only (fast).
@@ -169,6 +142,7 @@ class SystemMonitor:
                 pinfo['cpu_percent'] = 0.0
                 pinfo['memory_percent'] = 0.0
                 pinfo['memory_bytes'] = 0
+                pinfo['gpu_mb'] = 0.0
                 pinfo['status'] = '—'
                 processes.append(pinfo)
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
@@ -182,6 +156,7 @@ class SystemMonitor:
         """Fetch memory_percent for all cached processes.
         Slow (~4s on restricted machines). Call in a background thread only."""
         total = self._total_ram
+        gpu_vram = gpu_backend.get_process_vram() if GPU_AVAILABLE else {}
         enriched = []
         for proc in psutil.process_iter(['pid', 'name', 'memory_percent'], ad_value=0):
             try:
@@ -190,6 +165,7 @@ class SystemMonitor:
                     continue
                 pinfo['cpu_percent'] = 0.0
                 pinfo['memory_bytes'] = int((pinfo.get('memory_percent') or 0) / 100.0 * total)
+                pinfo['gpu_mb'] = gpu_vram.get(pinfo['pid'], 0.0)
                 pinfo['status'] = '—'
                 enriched.append(pinfo)
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
@@ -353,7 +329,7 @@ class MinimalView(tk.Toplevel):
         self.parent = parent
 
         self.title("ByteDog Mini")
-        self.geometry("200x80")
+        self.geometry("200x105" if GPU_AVAILABLE else "200x80")
         self.resizable(False, False)
         self.attributes('-topmost', True)
         self.overrideredirect(True)
@@ -394,6 +370,11 @@ class MinimalView(tk.Toplevel):
                                   font=('Consolas', 11))
         self.ram_label.pack()
 
+        if GPU_AVAILABLE:
+            self.gpu_label = tk.Label(self, text="GPU: 0%", fg='#00ff00', bg='#1e1e1e',
+                                      font=('Consolas', 11))
+            self.gpu_label.pack()
+
     def make_draggable(self):
         """Make window draggable"""
 
@@ -421,6 +402,13 @@ class MinimalView(tk.Toplevel):
 
             self.cpu_label.config(text=f"CPU: {cpu:.1f}%", fg=cpu_color)
             self.ram_label.config(text=f"RAM: {mem['percent']:.1f}%", fg=mem_color)
+
+            if GPU_AVAILABLE and hasattr(self, 'gpu_label'):
+                gpu_info = self.monitor.get_gpu_info()
+                if gpu_info:
+                    load = gpu_info['load']
+                    gpu_color = '#00ff00' if load < 50 else '#ffff00' if load < 80 else '#ff0000'
+                    self.gpu_label.config(text=f"GPU: {load:.1f}%", fg=gpu_color)
         except:
             pass
 
@@ -864,7 +852,7 @@ class ByteDogApp:
         scrollbar.pack(side='right', fill='y')
 
         # Treeview for processes
-        columns = ('PID', 'Name', 'CPU %', 'Memory %', 'Status')
+        columns = ('PID', 'Name', 'CPU %', 'Memory %', 'GPU MB', 'Status')
         self.process_tree = ttk.Treeview(list_frame, columns=columns, show='headings',
                                          yscrollcommand=scrollbar.set)
 
@@ -873,7 +861,7 @@ class ByteDogApp:
             self.process_tree.heading(col, text=col, command=lambda c=col: self.sort_processes(c))
             if col in ['PID']:
                 self.process_tree.column(col, width=80)
-            elif col in ['CPU %', 'Memory %']:
+            elif col in ['CPU %', 'Memory %', 'GPU MB']:
                 self.process_tree.column(col, width=100)
             elif col == 'Status':
                 self.process_tree.column(col, width=100)
@@ -1017,7 +1005,7 @@ class ByteDogApp:
     def sort_processes(self, column):
         """Sort process list by column"""
         col_map = {'PID': 'pid', 'Name': 'name', 'CPU %': 'cpu_percent',
-                   'Memory %': 'memory_percent', 'Status': 'status'}
+                   'Memory %': 'memory_percent', 'GPU MB': 'gpu_mb', 'Status': 'status'}
 
         if column in col_map:
             if self.sort_column == col_map[column]:
@@ -1156,6 +1144,7 @@ class ByteDogApp:
                 proc['name'][:30],
                 f"{proc.get('cpu_percent', 0):.1f}",
                 f"{proc.get('memory_percent', 0):.1f}",
+                f"{proc.get('gpu_mb', 0):.0f}",
                 proc['status']
             ))
 
@@ -2163,7 +2152,7 @@ def main():
     if GPU_AVAILABLE:
         print("✅ GPU monitoring available")
     else:
-        print("⚠️  GPU monitoring not available (install: pip install gputil)")
+        print("⚠️  GPU monitoring not available (install: pip install nvidia-ml-py)")
 
     # Survive the thrash we're fighting: HIGH priority + pinned working set
     for result in harden_self():

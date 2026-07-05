@@ -13,7 +13,13 @@ before that point.
 ## Features
 
 - Minimal / compact / detailed views (NetDog-style toggling), always-on-top overlay
-- Real-time CPU, RAM, GPU monitoring with history graphs
+- Real-time CPU, RAM, GPU monitoring with history graphs (GPU shown in the
+  minimal overlay too)
+- **GPU via NVML (nvidia-ml-py):** load, VRAM, temperature, all in-process
+  (no nvidia-smi subprocess, no console flashes under pythonw)
+- **Per-process VRAM column** in the process list; sourced from Windows GPU
+  performance counters (Task Manager's data source) since NVML hides
+  per-process memory under WDDM, with NVML process lists as fallback
 - Process list with kill / suspend / resume
 - **RAM Guardian with escalating thrash prevention:**
   - **Warn (default 75% RAM):** topmost alert with the biggest memory hogs
@@ -41,7 +47,8 @@ python bytedog.py
 ```
 
 or `run.bat`. Run as administrator for full suspend/kill coverage and
-auto-start installation. Requires `psutil` (and optionally `gputil`).
+auto-start installation. Requires `psutil` (and optionally `nvidia-ml-py`
+for GPU monitoring on NVIDIA cards).
 
 ## Configuration
 
