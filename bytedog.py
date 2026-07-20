@@ -439,7 +439,7 @@ class ByteDogApp:
         # Initialize CPU percent to prevent blocking
         psutil.cpu_percent(interval=None)
 
-        self.view_mode = tk.StringVar(value="minimal")  # Start with minimal like NetDog
+        self.view_mode = tk.StringVar(value="compact")  # Compact so it has a taskbar entry, like NetDog
         self.minimal_window = None
         self.selected_process = None
         self.sort_column = 'memory_percent'
@@ -479,9 +479,9 @@ class ByteDogApp:
         self.root.update_idletasks()
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        x = screen_width - 200 - 20  # Start smaller for minimal view
+        x = screen_width - 340 - 20  # Start sized for compact view (default)
         y = 50
-        self.root.geometry(f"200x80+{x}+{y}")
+        self.root.geometry(f"340x345+{x}+{y}")
 
         # Make window draggable
         self.root.bind('<Button-1>', self.start_drag)
@@ -2158,6 +2158,19 @@ def main():
     # Survive the thrash we're fighting: HIGH priority + pinned working set
     for result in harden_self():
         print(f"Guardian hardening: {result}")
+
+    # Start with Windows by default, but only ever auto-install once; if the
+    # user later removes it via Tools > Remove Auto-Start, that choice sticks.
+    autostart_marker = os.path.join(os.path.expanduser('~'), '.bytedog_autostart_initialized')
+    if not os.path.exists(autostart_marker):
+        ok, msg = install_autostart()
+        print(f"Auto-start: {msg}")
+        if ok:
+            try:
+                with open(autostart_marker, 'w') as f:
+                    f.write(datetime.now().isoformat())
+            except OSError:
+                pass
 
     app = ByteDogApp()
     app.run()

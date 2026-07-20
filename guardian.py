@@ -33,7 +33,8 @@ CHROMIUM_NAMES = frozenset({'chrome.exe', 'msedge.exe', 'brave.exe'})
 
 CONFIG_PATH = Path(os.environ.get('APPDATA', str(Path.home()))) / 'ByteDog' / 'config.json'
 
-AUTOSTART_TASK_NAME = 'ByteDogGuardian'
+AUTOSTART_APP_NAME = 'ByteDog'
+AUTOSTART_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
 @dataclass(frozen=True)
@@ -336,10 +337,13 @@ def harden_self(min_ws_mb: int = 60, max_ws_mb: int = 250) -> list:
     return results
 
 
-# ── Auto-start (Task Scheduler) ──────────────────────────────────────────
+# ── Auto-start (per-user registry Run key) ───────────────────────────────
 
 
 def _autostart_command() -> str:
+    """Command line used to relaunch ByteDog at logon."""
+    if getattr(sys, 'frozen', False):
+        return f'"{sys.executable}"'
     pythonw = Path(sys.executable).with_name('pythonw.exe')
     interpreter = pythonw if pythonw.exists() else Path(sys.executable)
     script = Path(__file__).with_name('bytedog.py')
@@ -347,35 +351,45 @@ def _autostart_command() -> str:
 
 
 def install_autostart() -> tuple:
-    """Register a logon task running ByteDog with highest privileges.
-    Returns (ok, message)."""
-    cmd = ['schtasks', '/Create', '/TN', AUTOSTART_TASK_NAME, '/SC', 'ONLOGON',
-           '/RL', 'HIGHEST', '/TR', _autostart_command(), '/F']
-    return _run_schtasks(cmd, 'Auto-start installed (runs at logon, elevated)')
+    """Register ByteDog to launch at Windows logon via the per-user Run key.
+    No elevation required. Returns (ok, message)."""
+    if sys.platform != 'win32':
+        return False, 'auto-start is Windows-only'
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY_PATH,
+                             0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, AUTOSTART_APP_NAME, 0, winreg.REG_SZ, _autostart_command())
+        return True, 'Auto-start installed (runs at logon)'
+    except OSError as e:
+        return False, f'registry write failed: {e}'
 
 
 def uninstall_autostart() -> tuple:
-    cmd = ['schtasks', '/Delete', '/TN', AUTOSTART_TASK_NAME, '/F']
-    return _run_schtasks(cmd, 'Auto-start removed')
+    """Remove ByteDog from the per-user Run key. Returns (ok, message)."""
+    if sys.platform != 'win32':
+        return False, 'auto-start is Windows-only'
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY_PATH,
+                             0, winreg.KEY_SET_VALUE) as key:
+            try:
+                winreg.DeleteValue(key, AUTOSTART_APP_NAME)
+            except FileNotFoundError:
+                pass
+        return True, 'Auto-start removed'
+    except OSError as e:
+        return False, f'registry write failed: {e}'
 
 
 def autostart_installed() -> bool:
-    try:
-        r = subprocess.run(['schtasks', '/Query', '/TN', AUTOSTART_TASK_NAME],
-                           capture_output=True, timeout=15,
-                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-        return r.returncode == 0
-    except Exception:
+    if sys.platform != 'win32':
         return False
-
-
-def _run_schtasks(cmd, success_msg) -> tuple:
+    import winreg
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
-                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-    except Exception as e:
-        return False, f'schtasks failed: {e}'
-    if r.returncode == 0:
-        return True, success_msg
-    err = (r.stderr or r.stdout or '').strip()
-    return False, f'schtasks error: {err} (run ByteDog as administrator)'
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY_PATH,
+                             0, winreg.KEY_READ) as key:
+            winreg.QueryValueEx(key, AUTOSTART_APP_NAME)
+        return True
+    except OSError:
+        return False
