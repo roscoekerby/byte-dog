@@ -70,6 +70,7 @@ class SystemMonitor:
         self.process_cache = []
         self.last_process_update = 0
         self._total_ram = psutil.virtual_memory().total
+        self._proc_handles = {}  # pid -> psutil.Process, kept across scans for cpu_percent() deltas
 
     def get_cpu_usage(self):
         """Get current CPU usage percentage"""
@@ -128,9 +129,9 @@ class SystemMonitor:
 
     def get_process_list(self, use_cache=False):
         """Get list of running processes — pid+name only (fast).
-        memory_percent and status are NOT fetched here; they take 4-17s on
-        machines with security software intercepting handle opens.
-        Call get_process_memory() separately, on demand."""
+        memory_percent, cpu_percent, and status are NOT fetched here; they
+        take 4-17s on machines with security software intercepting handle
+        opens. Call scan_process_memory() separately, on demand."""
         if use_cache and self.process_cache and (time.time() - self.last_process_update < 30):
             return self.process_cache
 
@@ -154,23 +155,56 @@ class SystemMonitor:
         return self.process_cache
 
     def scan_process_memory(self):
-        """Fetch memory_percent for all cached processes.
-        Slow (~4s on restricted machines). Call in a background thread only."""
+        """Fetch memory_percent and per-process cpu_percent for all processes.
+        Slow (~4s on restricted machines). Call in a background thread only.
+
+        cpu_percent needs a delta between two samples of the same
+        psutil.Process instance (a first call always returns a meaningless
+        0.0 "priming" value — see psutil docs), so _proc_handles keeps one
+        Process object per pid alive across calls to this method rather than
+        using the fresh, single-use instances process_iter() yields each time."""
         total = self._total_ram
         gpu_vram = gpu_backend.get_process_vram() if GPU_AVAILABLE else {}
         enriched = []
+        live_pids = set()
         for proc in psutil.process_iter(['pid', 'name', 'memory_percent'], ad_value=0):
             try:
                 pinfo = proc.info
+                pid = pinfo['pid']
                 if pinfo.get('name') is None:
                     continue
-                pinfo['cpu_percent'] = 0.0
+                live_pids.add(pid)
+
+                handle = self._proc_handles.get(pid)
+                cpu_pct = None
+                if handle is not None:
+                    try:
+                        cpu_pct = handle.cpu_percent(interval=None)
+                    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                        handle = None  # pid was reused by a different process; reprime below
+                if handle is None:
+                    handle = proc
+                    self._proc_handles[pid] = handle
+                    try:
+                        handle.cpu_percent(interval=None)  # prime; ignore the meaningless 0.0
+                    except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+                        pass
+                    cpu_pct = 0.0
+
+                pinfo['cpu_percent'] = cpu_pct or 0.0
                 pinfo['memory_bytes'] = int((pinfo.get('memory_percent') or 0) / 100.0 * total)
-                pinfo['gpu_mb'] = gpu_vram.get(pinfo['pid'], 0.0)
+                pinfo['gpu_mb'] = gpu_vram.get(pid, 0.0)
                 pinfo['status'] = '—'
                 enriched.append(pinfo)
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
                 continue
+
+        # Drop handles for processes that exited, so the cache doesn't grow
+        # unbounded over a long-running session.
+        for pid in list(self._proc_handles):
+            if pid not in live_pids:
+                del self._proc_handles[pid]
+
         self.process_cache = sorted(enriched, key=lambda x: x.get('memory_percent') or 0, reverse=True)
         self.last_process_update = time.time()
         return self.process_cache
@@ -494,6 +528,12 @@ class ByteDogApp:
 
     def start_drag(self, event):
         """Start dragging the window"""
+        # Compact/detailed views have a native title bar (overrideredirect False)
+        # to drag by; only minimal view needs this custom handler. Without this
+        # guard, bind_all makes every widget's click (sliders, checkboxes, etc.)
+        # drag the window instead of interacting with the widget.
+        if self.view_mode.get() != "minimal":
+            return
         # Don't drag if clicking on expand button
         if hasattr(self, 'minimal_expand_btn') and event.widget == self.minimal_expand_btn:
             return
@@ -506,6 +546,8 @@ class ByteDogApp:
 
     def on_drag(self, event):
         """Handle window dragging"""
+        if self.view_mode.get() != "minimal":
+            return
         x = self.root.winfo_pointerx() - self.drag_start_x
         y = self.root.winfo_pointery() - self.drag_start_y
         self.root.geometry(f"+{x}+{y}")
@@ -690,6 +732,8 @@ class ByteDogApp:
         # Create notebook for tabs
         notebook = ttk.Notebook(self.detailed_frame)
         notebook.pack(fill='both', expand=True)
+        self.detailed_notebook = notebook
+        notebook.bind('<<NotebookTabChanged>>', lambda e: self._maybe_refresh_active_process_tab())
 
         # Overview tab
         overview_tab = ttk.Frame(notebook)
@@ -802,7 +846,9 @@ class ByteDogApp:
             # Detailed mode - all information
             self.root.overrideredirect(False)
             self.detailed_frame.pack(fill='both', expand=True)
-            self.root.geometry("450x700")
+            # 620px (not 450px) so the process Treeview's 6 columns fit without
+            # clipping off-screen — see create_process_list's column widths.
+            self.root.geometry("620x700")
             if hasattr(self, 'detailed_toggle_btn'):
                 self.detailed_toggle_btn.config(text="▲")
             if hasattr(self, 'menubar'):
@@ -810,6 +856,7 @@ class ByteDogApp:
             # Restart guardian tab and performance graph refresh loops
             self.root.after(200, self.update_guardian_tab)
             self.root.after(200, self.update_performance_graph)
+            self._maybe_refresh_active_process_tab()
 
     def create_metric_card(self, parent, title, value, unit):
         """Create a metric display card"""
@@ -845,30 +892,33 @@ class ByteDogApp:
 
     def create_process_list(self, parent):
         """Create detailed process list view"""
-        # Frame for list and scrollbar
+        # Frame for list and scrollbars
         list_frame = ttk.Frame(parent)
         list_frame.pack(fill='both', expand=True)
 
-        # Scrollbar
-        scrollbar = ttk.Scrollbar(list_frame)
-        scrollbar.pack(side='right', fill='y')
+        vscroll = ttk.Scrollbar(list_frame, orient='vertical')
+        vscroll.pack(side='right', fill='y')
+        hscroll = ttk.Scrollbar(list_frame, orient='horizontal')
+        hscroll.pack(side='bottom', fill='x')
 
         # Treeview for processes
         columns = ('PID', 'Name', 'CPU %', 'Memory %', 'GPU MB', 'Status')
         self.process_tree = ttk.Treeview(list_frame, columns=columns, show='headings',
-                                         yscrollcommand=scrollbar.set)
+                                         yscrollcommand=vscroll.set, xscrollcommand=hscroll.set)
 
-        # Configure columns
+        # Explicit width for every column (an unmatched column silently keeps
+        # ttk's ~200px default) — sized to fit the 620px detailed-view window
+        # without clipping; hscroll above is the fallback if the window is
+        # resized narrower than that.
+        widths = {'PID': 70, 'Name': 200, 'CPU %': 70, 'Memory %': 85, 'GPU MB': 80, 'Status': 80}
         for col in columns:
             self.process_tree.heading(col, text=col, command=lambda c=col: self.sort_processes(c))
-            if col in ['PID']:
-                self.process_tree.column(col, width=80)
-            elif col in ['CPU %', 'Memory %', 'GPU MB']:
-                self.process_tree.column(col, width=100)
-            elif col == 'Status':
-                self.process_tree.column(col, width=100)
+            self.process_tree.column(col, width=widths[col], minwidth=50,
+                                     stretch=(col == 'Name'),
+                                     anchor='w' if col in ('Name', 'Status') else 'center')
 
-        scrollbar.config(command=self.process_tree.yview)
+        vscroll.config(command=self.process_tree.yview)
+        hscroll.config(command=self.process_tree.xview)
         self.process_tree.pack(fill='both', expand=True)
 
         # Context menu
@@ -1032,6 +1082,31 @@ class ByteDogApp:
             if hasattr(self, 'status_label'):
                 self.status_label.config(text=f"Found {len(procs)} processes", fg=self.colors['success'])
         self.trigger_process_scan(callback=_done)
+
+    def _active_detailed_tab_text(self):
+        """Text of the currently selected tab in the detailed-view notebook,
+        or None if not in detailed view / notebook not built yet."""
+        if self.view_mode.get() != 'detailed' or not hasattr(self, 'detailed_notebook'):
+            return None
+        try:
+            return self.detailed_notebook.tab(self.detailed_notebook.select(), 'text')
+        except tk.TclError:
+            return None
+
+    def _maybe_refresh_active_process_tab(self):
+        """Auto-scan when the Processes tab becomes the visible tab, so it
+        opens already sorted-by-memory like the Guardian alert screen does,
+        instead of sitting at all-zero columns until a manual Refresh click."""
+        if self._active_detailed_tab_text() == 'Processes':
+            self.refresh_processes()
+
+    def _process_tab_autorefresh_tick(self):
+        """Keep Memory %/GPU MB/CPU % from going stale if the user leaves the
+        Processes tab open — re-scans on an interval well above the scan's
+        own worst-case latency (~4-17s on AV-intercepted machines)."""
+        if self._active_detailed_tab_text() == 'Processes':
+            self.refresh_processes()
+        self.root.after(15000, self._process_tab_autorefresh_tick)
 
     def show_process_menu(self, event):
         """Show context menu for process"""
@@ -2123,6 +2198,7 @@ Created with Python and psutil
         # Start metric updates
         self.update_metrics()
         self.root.after(2000, self.schedule_metric_updates)
+        self.root.after(15000, self._process_tab_autorefresh_tick)
 
         # Handle window closing
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)

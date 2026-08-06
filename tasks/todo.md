@@ -94,3 +94,60 @@ Not done: no CPU-thrash tier (Guardian is RAM/swap-pressure only, per
 existing design) and no REALTIME priority bump — HIGH priority plus the
 now-fully-working working-set pin was judged sufficient; REALTIME risks
 starving the rest of the system, which cuts against the goal.
+
+# Fix: Processes tab looked broken vs. the Guardian alert screen
+
+Follow-up bug report: the RAM Guardian alert screen shows a clean,
+memory-sorted hog list, but Detailed view -> Processes tab looked "more
+difficult / visually obscure" by comparison. Root-caused to three
+independent, additive issues (see `_raw` wiki capture for the full
+diagnosis); user said "yes fix all".
+
+## Plan
+- [x] Auto-scan on tab open: `<<NotebookTabChanged>>` bound on the detailed
+      notebook (`bytedog.py` `create_detailed_view`) plus a check on
+      entering detailed view, both routed through
+      `_maybe_refresh_active_process_tab()` -> `refresh_processes()`, so the
+      tab opens already sorted by memory instead of sitting at all-zero
+      columns until a manual Refresh click
+- [x] Kept it fresh while left open: `_process_tab_autorefresh_tick()`
+      re-scans every 15s only while the Processes tab is the active tab
+      (well above the scan's own ~4-17s worst case on AV-intercepted
+      machines, so it never overlaps itself)
+- [x] Real per-process CPU%: `SystemMonitor._proc_handles` keeps one
+      `psutil.Process` per pid alive across `scan_process_memory()` calls
+      (previously every call used fresh, single-use instances from
+      `process_iter()`, so `cpu_percent()` could never produce a delta and
+      the column was hardcoded to 0.0). Handles a first-sighting "prime"
+      call, PID-reuse (NoSuchProcess on a stale handle triggers a
+      re-prime), and pruning dead pids so the cache doesn't grow unbounded
+- [x] Column overflow: explicit width for all 6 Treeview columns
+      (previously `Name` fell through the width `if/elif` unmatched and
+      kept ttk's ~200px default); detailed-view window widened 450px ->
+      620px to fit them; added a horizontal scrollbar as a fallback for
+      if the window gets resized narrower
+- [x] `python -m py_compile` + `pytest -q`: 40/40 pass
+- [x] Live smoke test: launched `python bytedog.py --no-elevate` in the
+      background (unbuffered), confirmed it reaches the Tk mainloop with no
+      traceback — `create_detailed_view()` (and therefore the new Treeview
+      column config) runs unconditionally at startup regardless of the
+      default view mode ("compact"), so this exercises the changed code
+      even though the window isn't visibly the active view. Killed only
+      the test process afterward, left the user's pre-existing running
+      ByteDog instances untouched
+- [ ] Visual confirmation — native Tk window, can't screenshot it from here;
+      user to eyeball Detailed -> Processes after this ships
+
+## Review
+
+**What changed and why:** all three causes from the diagnosis were fixed
+together since they're additive — fixing only one would still leave the
+tab looking broken relative to the alert screen. The CPU% fix is the one
+worth flagging: it's not a UI tweak, it required a persistent per-pid
+`psutil.Process` cache because `cpu_percent()` is stateful (needs the same
+object queried twice to produce a real delta), which the existing
+fire-and-forget `process_iter()` usage couldn't support.
+
+Not verified by me: actual visual layout in a running window (no
+screenshot tooling for a native Tk app available here) — confirmed via
+compile + tests + a clean background launch instead.
