@@ -38,6 +38,11 @@ before that point.
   interception that makes psutil scans take 15+ seconds
 - **Self-hardening:** runs at HIGH priority with a pinned working set so the
   rescue UI stays responsive during the very thrash it is fighting
+- **Self-elevating:** on launch, if not already admin, ByteDog relaunches
+  itself with a UAC prompt so kill/suspend and working-set pinning work at
+  full strength without you having to fight a frozen Explorer to manually
+  "Run as administrator" mid-thrash. Declining the prompt is fine — it
+  keeps running non-elevated, just with reduced kill/suspend coverage
 - **Auto-start:** Tools menu installs a Task Scheduler logon task (elevated)
 
 ## Run
@@ -46,9 +51,11 @@ before that point.
 python bytedog.py
 ```
 
-or `run.bat`. Run as administrator for full suspend/kill coverage and
-auto-start installation. Requires `psutil` (and optionally `nvidia-ml-py`
-for GPU monitoring on NVIDIA cards).
+or `run.bat`. Launching either way triggers one UAC elevation prompt (unless
+already admin); accept it for full suspend/kill coverage and auto-start
+installation. Pass `--no-elevate` to skip the prompt during development.
+Requires `psutil` (and optionally `nvidia-ml-py` for GPU monitoring on
+NVIDIA cards).
 
 ## Configuration
 

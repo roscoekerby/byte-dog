@@ -23,6 +23,7 @@ from guardian import (
     DEFAULT_PROTECTED, GuardianConfig, EscalationEngine,
     fast_memory_snapshot, enrich_chromium, select_targets, group_by_name,
     harden_self, install_autostart, uninstall_autostart, autostart_installed,
+    is_admin, relaunch_elevated, enable_debug_privilege,
 )
 
 # GPU backend: NVML via nvidia-ml-py + PDH per-process VRAM (both in-process,
@@ -2140,14 +2141,17 @@ Created with Python and psutil
 
 def main():
     """Main entry point"""
-    # Check for admin privileges on Windows
-    if platform.system() == 'Windows':
-        try:
-            import ctypes
-            if not ctypes.windll.shell32.IsUserAnAdmin():
-                print("Note: Some features may require administrator privileges")
-        except:
-            pass
+    # Kill/suspend AccessDenied and a silently-partial self-hardening both
+    # come from not running elevated. Self-relaunch with a UAC prompt rather
+    # than just warning: during a real thrash, manually re-launching "as
+    # administrator" is exactly the kind of interaction that stops working.
+    if platform.system() == 'Windows' and '--no-elevate' not in sys.argv:
+        if not is_admin():
+            print("Not running as admin — requesting elevation for full kill/suspend coverage...")
+            if relaunch_elevated():
+                return  # elevated instance is starting; this one exits
+            print("Elevation declined or unavailable — continuing without admin rights "
+                  "(some kill/suspend actions on other users' or hardened processes may fail).")
 
     # Check if GPU monitoring is available
     if GPU_AVAILABLE:
@@ -2156,8 +2160,11 @@ def main():
         print("⚠️  GPU monitoring not available (install: pip install nvidia-ml-py)")
 
     # Survive the thrash we're fighting: HIGH priority + pinned working set
+    # (working-set pin needs admin — see harden_self docstring — so this is
+    # only fully effective once the elevation above has succeeded)
     for result in harden_self():
         print(f"Guardian hardening: {result}")
+    print(f"Guardian hardening: {enable_debug_privilege()}")
 
     # Start with Windows by default, but only ever auto-install once; if the
     # user later removes it via Tools > Remove Auto-Start, that choice sticks.

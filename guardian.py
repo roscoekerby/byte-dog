@@ -300,6 +300,123 @@ def fast_memory_snapshot():
     return procs
 
 
+# ── Elevation ─────────────────────────────────────────────────────────────
+# Kill/suspend failures ("AccessDenied") and a partial self-hardening
+# (working-set pin silently no-ops without admin, see harden_self) both trace
+# back to one root cause: ByteDog usually isn't elevated. Self-relaunch with
+# a UAC prompt closes that gap instead of just telling the user to re-launch
+# manually — the whole point of the guardian is to act *during* a thrash,
+# when fighting with Explorer to right-click "Run as administrator" is
+# exactly the kind of interaction that becomes impossible.
+
+
+def is_admin() -> bool:
+    """True if the current process token has administrator privileges."""
+    if sys.platform != 'win32':
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _elevate_command() -> tuple:
+    """(executable, params) used to relaunch ByteDog elevated via ShellExecuteW."""
+    if getattr(sys, 'frozen', False):
+        return sys.executable, ' '.join(f'"{a}"' for a in sys.argv[1:])
+    pythonw = Path(sys.executable).with_name('pythonw.exe')
+    interpreter = pythonw if pythonw.exists() else Path(sys.executable)
+    script = Path(__file__).with_name('bytedog.py')
+    args = [str(script)] + sys.argv[1:]
+    return str(interpreter), ' '.join(f'"{a}"' for a in args)
+
+
+def relaunch_elevated() -> bool:
+    """Relaunch ByteDog with a UAC elevation prompt. Returns True if a new
+    elevated instance was launched (caller should exit this one); False if
+    the user declined the prompt or the relaunch failed (caller should keep
+    running non-elevated rather than block on it)."""
+    if sys.platform != 'win32':
+        return False
+    exe, params = _elevate_command()
+    try:
+        # >32 = success per ShellExecute docs (32 itself is the last error
+        # code, everything <=32 is a failure); 1223 = user cancelled the UAC
+        # prompt, which ShellExecuteW also reports via a <=32 return value.
+        result = ctypes.windll.shell32.ShellExecuteW(None, 'runas', exe, params, None, 1)
+        return result > 32
+    except Exception:
+        return False
+
+
+def enable_debug_privilege() -> str:
+    """Enable SeDebugPrivilege on the current process token so kill/suspend
+    can reach processes outside the normal same-user ACL (e.g. another user's
+    session, or a process with a hardened DACL) — still subject to the
+    DEFAULT_PROTECTED denylist, which is a decision, not a permission. Only
+    takes effect when already elevated; never raises."""
+    if sys.platform != 'win32':
+        return 'skipped (not Windows)'
+
+    advapi32 = ctypes.WinDLL('advapi32', use_last_error=True)
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+    TOKEN_ADJUST_PRIVILEGES = 0x0020
+    TOKEN_QUERY = 0x0008
+    SE_PRIVILEGE_ENABLED = 0x00000002
+    ERROR_NOT_ALL_ASSIGNED = 1300
+
+    class LUID(ctypes.Structure):
+        _fields_ = [('LowPart', wintypes.DWORD), ('HighPart', wintypes.LONG)]
+
+    class LUID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [('Luid', LUID), ('Attributes', wintypes.DWORD)]
+
+    class TOKEN_PRIVILEGES(ctypes.Structure):
+        _fields_ = [('PrivilegeCount', wintypes.DWORD),
+                    ('Privileges', LUID_AND_ATTRIBUTES * 1)]
+
+    # Without explicit argtypes/restype, ctypes marshals the -1 pseudo-handle
+    # from GetCurrentProcess() as a 32-bit value on 64-bit Windows, silently
+    # corrupting it before it reaches OpenProcessToken (fails as "invalid
+    # handle"). Every handle-bearing call below must declare its signature.
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    advapi32.OpenProcessToken.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.LookupPrivilegeValueW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
+    advapi32.LookupPrivilegeValueW.restype = wintypes.BOOL
+    advapi32.AdjustTokenPrivileges.argtypes = [
+        wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(TOKEN_PRIVILEGES),
+        wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+    advapi32.AdjustTokenPrivileges.restype = wintypes.BOOL
+
+    htoken = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, ctypes.byref(htoken)):
+        return f'debug privilege failed: OpenProcessToken error {ctypes.get_last_error()}'
+
+    try:
+        luid = LUID()
+        if not advapi32.LookupPrivilegeValueW(None, 'SeDebugPrivilege', ctypes.byref(luid)):
+            return f'debug privilege failed: LookupPrivilegeValue error {ctypes.get_last_error()}'
+
+        tp = TOKEN_PRIVILEGES(PrivilegeCount=1,
+                               Privileges=(LUID_AND_ATTRIBUTES(luid, SE_PRIVILEGE_ENABLED),))
+        ctypes.set_last_error(0)
+        if not advapi32.AdjustTokenPrivileges(htoken, False, ctypes.byref(tp), 0, None, None):
+            return f'debug privilege failed: AdjustTokenPrivileges error {ctypes.get_last_error()}'
+        if ctypes.get_last_error() == ERROR_NOT_ALL_ASSIGNED:
+            return 'debug privilege not granted (requires admin)'
+        return 'debug privilege: enabled'
+    finally:
+        kernel32.CloseHandle(htoken)
+
+
 # ── Self-hardening ───────────────────────────────────────────────────────
 
 

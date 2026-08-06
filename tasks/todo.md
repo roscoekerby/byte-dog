@@ -47,3 +47,50 @@ get_gpu_info() interface, add per-process VRAM, add GPU to the minimal view.
 - Note: on this Optimus laptop most desktop apps render on the iGPU, so
   dedicated-VRAM values are near zero at idle; the column becomes meaningful
   when ollama/games/ML workloads load the discrete card.
+
+# Fix: Guardian couldn't actually kill/suspend hogs during a real thrash
+
+Bug report: RAM Guardian correctly warned at 80%/90%, but manual "Kill Top
+Hog" failed with "may need admin rights" — right when the system was
+thrashing hard enough that fighting Explorer to relaunch "as administrator"
+wasn't a realistic option anymore.
+
+## Plan
+- [x] Root-cause: `psutil.Process.terminate/suspend` need the same or higher
+      privilege as the target; ByteDog wasn't running elevated, and wasn't
+      offering to become elevated
+- [x] `guardian.py`: `is_admin()`, `relaunch_elevated()` (UAC self-relaunch
+      via `ShellExecuteW(..., "runas", ...)`), `enable_debug_privilege()`
+      (SeDebugPrivilege on the token, widens reach without touching the
+      DEFAULT_PROTECTED denylist)
+- [x] `bytedog.py` `main()`: attempt elevated self-relaunch before starting
+      the UI; `--no-elevate` flag to skip during dev; falls back to running
+      non-elevated (with a printed warning) if the UAC prompt is declined,
+      rather than blocking
+- [x] Bug caught during manual verification: `enable_debug_privilege()`
+      first cut omitted `restype`/`argtypes` on the Win32 calls, so
+      `GetCurrentProcess()`'s -1 pseudo-handle got truncated to 32-bit and
+      `OpenProcessToken` failed with error 6 (invalid handle) even though
+      the logic was otherwise correct — fixed by declaring signatures
+      exactly like the existing `harden_self()` pattern does
+- [x] `pytest -q`: 40/40 still pass (bytedog.main() isn't exercised by
+      tests, so this needed a manual `python -c` smoke check against the
+      real Win32 API, not just import)
+- [x] README updated: elevation-on-launch documented, old "run as admin
+      manually" guidance replaced
+
+## Review
+
+**What changed and why:** ByteDog now self-elevates via a UAC prompt on
+startup instead of silently degrading and telling the user after the fact
+that an action needed admin rights. This closes the gap between "the
+warning fired" and "the kill button actually worked" — the exact failure
+the user hit. `enable_debug_privilege()` is a secondary hardening step for
+the remaining edge case (killing a process outside the normal same-user
+ACL) once elevated. Declining the UAC prompt still works — non-elevated
+mode is unchanged, just with the same reduced coverage as before.
+
+Not done: no CPU-thrash tier (Guardian is RAM/swap-pressure only, per
+existing design) and no REALTIME priority bump — HIGH priority plus the
+now-fully-working working-set pin was judged sufficient; REALTIME risks
+starving the rest of the system, which cuts against the goal.
