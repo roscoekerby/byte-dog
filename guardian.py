@@ -31,6 +31,93 @@ DEFAULT_PROTECTED = frozenset({
 # Chromium-family browsers: only renderer processes are auto-action targets
 CHROMIUM_NAMES = frozenset({'chrome.exe', 'msedge.exe', 'brave.exe'})
 
+# Human-readable consequence text for the manual-kill/suspend override
+# dialog. select_targets() already keeps the guardian's own automatic
+# escalation off these names; this is what the UI shows a user who
+# deliberately targets one by hand and wants to know what breaks.
+PROTECTED_INFO = {
+    'system': "Windows kernel system process — not a real killable process; "
+              "Windows will refuse, or forcing it can crash the machine.",
+    'secure system': "Virtualization-based security (VBS) container process. "
+                     "Not really killable; core to Windows security isolation.",
+    'registry': "Backing process for the Windows Registry hive in memory. "
+               "Not a normal killable process.",
+    'idle': "Kernel idle-time placeholder — not a real process.",
+    'memory compression': "Manages RAM-compressed pages. Killing it forces "
+                          "those pages out abruptly and can crash your session.",
+    'memcompression': "Manages RAM-compressed pages. Killing it forces those "
+                      "pages out abruptly and can crash your session.",
+    'smss.exe': "Session Manager Subsystem — creates new Windows sessions. "
+               "Killing it typically crashes Windows immediately (BSOD or "
+               "forced reboot).",
+    'csrss.exe': "Client/Server Runtime Subsystem — core to the Win32 "
+                "subsystem. Killing it crashes Windows instantly.",
+    'wininit.exe': "Windows Initialization process — starts core services at "
+                   "boot. Killing it typically crashes the current session.",
+    'winlogon.exe': "Handles sign-in, sign-out, the lock screen, and "
+                    "Ctrl+Alt+Del. Killing it logs you out immediately and "
+                    "can crash the session.",
+    'services.exe': "Service Control Manager — starts, stops, and manages "
+                    "every Windows service. Killing it typically crashes "
+                    "Windows.",
+    'lsass.exe': "Local Security Authority — verifies logins and issues "
+                "security tokens. Windows deliberately reboots the machine "
+                "if this process dies.",
+    'svchost.exe': "Generic host for Windows service DLLs — one svchost.exe "
+                   "instance may be running networking, audio, Windows "
+                   "Update, or other core services. Killing the wrong one "
+                   "can cut network/audio/other services and may "
+                   "destabilize the session.",
+    'explorer.exe': "Windows shell — your desktop, taskbar, Start menu, and "
+                    "File Explorer windows. Killing it closes your desktop "
+                    "shell (modern Windows usually restarts it "
+                    "automatically, but you'll briefly lose the "
+                    "taskbar/desktop).",
+    'dwm.exe': "Desktop Window Manager — renders window compositing and the "
+              "visible output of your desktop. Killing it can blank or "
+              "flash the screen and force your session back to the lock "
+              "screen while it restarts.",
+    'ntoskrnl.exe': "The Windows kernel executive image itself. Cannot "
+                    "actually be killed as a normal process.",
+    'fontdrvhost.exe': "Font rendering host used by the desktop compositor "
+                       "and lock screen. Killing it can break text "
+                       "rendering or crash the sign-in/desktop session.",
+    'spoolsv.exe': "Print Spooler service. Killing it only breaks printing "
+                   "until Windows restarts it — lower risk than most on "
+                   "this list.",
+    'audiodg.exe': "Windows Audio Device Graph — mixes and applies effects "
+                   "to all system audio. Killing it cuts all sound until "
+                   "Windows restarts it.",
+    'taskhostw.exe': "Hosts DLL-based background Windows tasks triggered by "
+                     "Task Scheduler. Killing it interrupts whatever "
+                     "background task it's currently running.",
+    'runtimebroker.exe': "Manages permission checks for Windows Store / UWP "
+                         "apps. Killing it can break a UWP app's permission "
+                         "checks or crash it mid-use.",
+    'msmpeng.exe': "Windows Defender Antivirus's real-time protection "
+                   "engine. Killing it disables real-time malware "
+                   "protection until Windows restarts it.",
+    'vmmem': "Memory-management placeholder for WSL2/Hyper-V virtual "
+            "machines. Killing it can crash your WSL2/Docker/VM sessions "
+            "and lose unsaved work inside them.",
+    'bytedog.exe': "ByteDog itself — the app currently protecting you from "
+                   "this thrash. Killing it removes your ability to rescue "
+                   "the system.",
+}
+
+
+def protected_reason(name: str) -> str:
+    """Human-readable consequence text for a protected process name, shown
+    on the manual kill/suspend override dialog. Falls back to a generic
+    message for names on the user's own 'never touch' list that aren't in
+    PROTECTED_INFO (DEFAULT_PROTECTED entries are all covered above)."""
+    return PROTECTED_INFO.get(
+        (name or '').lower(),
+        "This process is on your protected list. It has no specific "
+        "consequence description on file, but was marked protected "
+        "because killing or suspending it is expected to be risky or "
+        "disruptive.")
+
 CONFIG_PATH = Path(os.environ.get('APPDATA', str(Path.home()))) / 'ByteDog' / 'config.json'
 
 AUTOSTART_APP_NAME = 'ByteDog'

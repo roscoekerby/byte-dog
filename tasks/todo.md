@@ -151,3 +151,73 @@ fire-and-forget `process_iter()` usage couldn't support.
 Not verified by me: actual visual layout in a running window (no
 screenshot tooling for a native Tk app available here) — confirmed via
 compile + tests + a clean background launch instead.
+
+# Feature: block manual kill/suspend of protected processes without an explicit override
+
+Follow-up request: the self-elevation fix (above) means ByteDog can now
+actually succeed at killing/suspending system-critical processes it
+previously failed against with AccessDenied — the Processes tab's manual
+Kill/Suspend had *no* protected-process check at all (unlike the guardian's
+automatic escalation, which already excludes DEFAULT_PROTECTED via
+`select_targets`). User: grey out critical processes in the list, and gate
+any kill/suspend attempt on them behind an override that explains the
+specific consequence (their example: the process controlling display
+output, i.e. dwm.exe).
+
+## Plan
+- [x] `guardian.py`: `PROTECTED_INFO` dict — one human-readable consequence
+      description per `DEFAULT_PROTECTED` name (csrss.exe/smss.exe/wininit.exe/
+      winlogon.exe/services.exe -> "typically crashes/reboots Windows",
+      lsass.exe -> "Windows deliberately reboots if this dies", dwm.exe ->
+      "can blank/flash the screen and force back to the lock screen" (the
+      user's named example), svchost.exe -> "which service depends on which
+      instance" caveat, etc. `protected_reason(name)` does the case-insensitive
+      lookup with a generic fallback for user-added protected names with no
+      description on file
+- [x] Coverage-checked: every `DEFAULT_PROTECTED` name has a `PROTECTED_INFO`
+      entry (scripted check, zero missing)
+- [x] Processes tab: protected rows greyed (`#777777`) via a Treeview tag,
+      applied in `update_process_list` through a new `_is_protected()` helper
+      (checks `self.guardian.config.protected_names()` — default list plus
+      whatever the user added)
+- [x] Kill/Suspend on a protected process (button or right-click context
+      menu — both route through the same `kill_selected_process`/
+      `suspend_selected_process` handlers) no longer uses the plain Yes/No
+      confirm; it opens `_show_protected_override_dialog`: names the
+      process, states the specific consequence, and requires an explicit
+      "Override & Kill/Suspend Anyway" click rather than a casual Yes.
+      Non-protected processes keep the existing (kill: confirm, suspend: no
+      confirm, reversible) behavior unchanged
+- [x] Context menu labels get a 🔒 prefix on Kill/Suspend when the
+      right-clicked process is protected, so the risk is visible before the
+      dialog even opens
+- [x] Design choice made without asking: didn't disable the toolbar
+      Kill/Suspend buttons via selection-change binding (an alternative,
+      more literal reading of "grey them out"); the always-visible greyed
+      row plus a mandatory override dialog on click was judged simpler and
+      equally effective — easy to revisit if the button-disabling version is
+      preferred instead
+- [x] `python -m py_compile` + `pytest -q`: 40/40 pass
+- [x] `guardian.protected_reason()` spot-checked directly (dwm.exe, case
+      insensitivity, unknown-name fallback) and full DEFAULT_PROTECTED
+      coverage scripted-verified
+- [x] Live smoke test: background launch reaches Tk mainloop with no
+      traceback, same method as the prior two fixes
+- [ ] Visual confirmation — user to eyeball the grey rows + override dialog
+      (try selecting explorer.exe or dwm.exe and hitting Kill)
+
+## Review
+
+**What changed and why:** this closes a real safety gap the elevation fix
+(above) opened up — before elevation, a manual kill on e.g. lsass.exe would
+just silently fail with AccessDenied; now that ByteDog runs elevated by
+default, that same click could actually succeed and crash the system. The
+guardian's *automatic* escalation was already safe (`select_targets`
+excludes `DEFAULT_PROTECTED`); this brings the *manual* kill/suspend path
+up to the same standard, plus adds the specific-consequence explanation the
+user asked for rather than a generic "are you sure?".
+
+Not done: didn't extend protection to the alert-screen's "Kill Top
+Hog"/"Suspend Top" manual buttons — they were already safe, since they only
+ever pick from `select_targets()`'s already-filtered candidate list, so a
+protected process can never appear as a "top hog" target through that path.

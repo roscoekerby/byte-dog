@@ -23,7 +23,7 @@ from guardian import (
     DEFAULT_PROTECTED, GuardianConfig, EscalationEngine,
     fast_memory_snapshot, enrich_chromium, select_targets, group_by_name,
     harden_self, install_autostart, uninstall_autostart, autostart_installed,
-    is_admin, relaunch_elevated, enable_debug_privilege,
+    is_admin, relaunch_elevated, enable_debug_privilege, protected_reason,
 )
 
 # GPU backend: NVML via nvidia-ml-py + PDH per-process VRAM (both in-process,
@@ -921,6 +921,11 @@ class ByteDogApp:
         hscroll.config(command=self.process_tree.xview)
         self.process_tree.pack(fill='both', expand=True)
 
+        # Protected processes (system-critical, or user-added to the
+        # never-touch list) are greyed out so it's obvious at a glance which
+        # rows Kill/Suspend won't act on without an explicit override.
+        self.process_tree.tag_configure('protected', foreground='#777777')
+
         # Context menu
         self.process_tree.bind('<Button-3>', self.show_process_menu)
 
@@ -1113,45 +1118,111 @@ class ByteDogApp:
         item = self.process_tree.identify('item', event.x, event.y)
         if item:
             self.process_tree.selection_set(item)
+            name = self.process_tree.item(item)['values'][1]
+            lock = '🔒 ' if self._is_protected(name) else ''
 
             menu = tk.Menu(self.root, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
-            menu.add_command(label="Kill Process", command=self.kill_selected_process)
-            menu.add_command(label="Suspend Process", command=self.suspend_selected_process)
+            menu.add_command(label=f"{lock}Kill Process", command=self.kill_selected_process)
+            menu.add_command(label=f"{lock}Suspend Process", command=self.suspend_selected_process)
             menu.add_command(label="Resume Process", command=self.resume_selected_process)
             menu.add_separator()
             menu.add_command(label="Process Details", command=self.show_process_details)
 
             menu.post(event.x_root, event.y_root)
 
-    def kill_selected_process(self):
-        """Kill selected process"""
-        if hasattr(self, 'process_tree'):
-            selection = self.process_tree.selection()
-            if selection:
-                item = self.process_tree.item(selection[0])
-                pid = item['values'][0]
-                name = item['values'][1]
+    def _show_protected_override_dialog(self, name, pid, action) -> bool:
+        """Modal warning for kill/suspend on a protected process: explains
+        the specific consequence and requires an explicit 'Override' click
+        rather than a plain Yes/No. Returns True only if the user overrides."""
+        verb = 'Kill' if action == 'kill' else 'Suspend'
+        result = {'override': False}
 
-                if messagebox.askyesno("Confirm", f"Kill process '{name}' (PID: {pid})?"):
-                    if self.process_manager.kill_process(pid):
-                        self.status_label.config(text=f"Killed process {pid}", fg=self.colors['success'])
-                    else:
-                        self.status_label.config(text=f"Failed to kill process {pid}", fg=self.colors['error'])
-                    self.refresh_processes()
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Protected Process — {name}")
+        dialog.configure(bg=self.colors['bg'])
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+
+        tk.Label(dialog, text=f"⚠ '{name}' (PID {pid}) is a protected process",
+                bg=self.colors['bg'], fg=self.colors['error'], font=('Arial', 11, 'bold'),
+                wraplength=380, justify='left').pack(padx=16, pady=(16, 8), anchor='w')
+        tk.Label(dialog, text=protected_reason(name), bg=self.colors['bg'], fg=self.colors['fg'],
+                font=('Arial', 10), wraplength=380, justify='left').pack(padx=16, pady=(0, 12), anchor='w')
+        tk.Label(dialog,
+                text=f"ByteDog won't {verb.lower()} this process by default — only override "
+                     f"if you understand and accept the risk above.",
+                bg=self.colors['bg'], fg=self.colors['warning'], font=('Arial', 9, 'italic'),
+                wraplength=380, justify='left').pack(padx=16, pady=(0, 16), anchor='w')
+
+        btn_frame = tk.Frame(dialog, bg=self.colors['bg'])
+        btn_frame.pack(pady=(0, 16))
+
+        def _cancel():
+            result['override'] = False
+            dialog.destroy()
+
+        def _override():
+            result['override'] = True
+            dialog.destroy()
+
+        tk.Button(btn_frame, text="Cancel", width=12, command=_cancel,
+                 bg=self.colors['button'], fg=self.colors['fg']).pack(side='left', padx=6)
+        tk.Button(btn_frame, text=f"Override & {verb} Anyway", width=22, command=_override,
+                 bg=self.colors['error'], fg='white').pack(side='left', padx=6)
+
+        dialog.protocol("WM_DELETE_WINDOW", _cancel)
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+        dialog.grab_set()
+        dialog.wait_window()
+        return result['override']
+
+    def kill_selected_process(self):
+        """Kill selected process — protected processes require an explicit
+        override through _show_protected_override_dialog instead of the
+        plain yes/no confirm."""
+        if not hasattr(self, 'process_tree'):
+            return
+        selection = self.process_tree.selection()
+        if not selection:
+            return
+        item = self.process_tree.item(selection[0])
+        pid, name = item['values'][0], item['values'][1]
+
+        if self._is_protected(name):
+            if not self._show_protected_override_dialog(name, pid, 'kill'):
+                return
+        elif not messagebox.askyesno("Confirm", f"Kill process '{name}' (PID: {pid})?"):
+            return
+
+        if self.process_manager.kill_process(pid):
+            self.status_label.config(text=f"Killed process {pid}", fg=self.colors['success'])
+        else:
+            self.status_label.config(text=f"Failed to kill process {pid}", fg=self.colors['error'])
+        self.refresh_processes()
 
     def suspend_selected_process(self):
-        """Suspend selected process"""
-        if hasattr(self, 'process_tree'):
-            selection = self.process_tree.selection()
-            if selection:
-                item = self.process_tree.item(selection[0])
-                pid = item['values'][0]
+        """Suspend selected process — protected processes require an
+        explicit override through _show_protected_override_dialog."""
+        if not hasattr(self, 'process_tree'):
+            return
+        selection = self.process_tree.selection()
+        if not selection:
+            return
+        item = self.process_tree.item(selection[0])
+        pid, name = item['values'][0], item['values'][1]
 
-                if self.process_manager.suspend_process(pid):
-                    self.status_label.config(text=f"Suspended process {pid}", fg=self.colors['success'])
-                else:
-                    self.status_label.config(text=f"Failed to suspend process {pid}", fg=self.colors['error'])
-                self.refresh_processes()
+        if self._is_protected(name) and not self._show_protected_override_dialog(name, pid, 'suspend'):
+            return
+
+        if self.process_manager.suspend_process(pid):
+            self.status_label.config(text=f"Suspended process {pid}", fg=self.colors['success'])
+        else:
+            self.status_label.config(text=f"Failed to suspend process {pid}", fg=self.colors['error'])
+        self.refresh_processes()
 
     def resume_selected_process(self):
         """Resume selected process"""
@@ -1216,6 +1287,7 @@ class ByteDogApp:
 
         # Add to tree (limit to top 100 for performance)
         for proc in processes[:100]:
+            tags = ('protected',) if self._is_protected(proc['name']) else ()
             self.process_tree.insert('', 'end', values=(
                 proc['pid'],
                 proc['name'][:30],
@@ -1223,7 +1295,12 @@ class ByteDogApp:
                 f"{proc.get('memory_percent', 0):.1f}",
                 f"{proc.get('gpu_mb', 0):.0f}",
                 proc['status']
-            ))
+            ), tags=tags)
+
+    def _is_protected(self, name) -> bool:
+        """True if `name` is on the guardian's protected/never-touch list
+        (system-critical defaults plus anything the user added)."""
+        return (name or '').lower() in self.guardian.config.protected_names()
 
     def update_simple_process_display(self):
         """Update simple process display for compact view"""
