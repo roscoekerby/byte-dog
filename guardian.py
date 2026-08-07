@@ -541,6 +541,63 @@ def harden_self(min_ws_mb: int = 60, max_ws_mb: int = 250) -> list:
     return results
 
 
+# ── Graceful close (manual kill path only) ───────────────────────────────
+# Real Task Manager "End Task" posts WM_CLOSE to an app's top-level windows
+# first, giving it a chance to prompt "save changes?" before force-killing.
+# psutil's terminate()/kill() are both TerminateProcess on Windows: zero
+# grace period. This mirrors the WM_CLOSE step, manual-kill-only: the
+# Guardian's automatic emergency kill path must stay fast and never calls it.
+
+
+def graceful_close_process(pid: int, timeout: float = 3.0) -> bool:
+    """Post WM_CLOSE to all visible top-level windows owned by pid. Returns
+    True if at least one window was signaled (caller should then poll
+    proc.is_running() for up to `timeout` before falling back to a hard
+    kill). Windows-only; never raises — any failure returns False so the
+    caller falls straight through to the existing terminate()/kill() logic."""
+    if sys.platform != 'win32':
+        return False
+    try:
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+
+        # Every function in this chain needs explicit argtypes/restype;
+        # see enable_debug_privilege()/harden_self() above for why: without
+        # them ctypes can silently truncate/mismarshal handles and args on
+        # 64-bit Windows.
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.PostMessageW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.PostMessageW.restype = wintypes.BOOL
+
+        WM_CLOSE = 0x0010
+        signaled = []
+
+        def _callback(hwnd, lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                owner_pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+                if owner_pid.value == pid:
+                    user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+                    signaled.append(hwnd)
+            except Exception:
+                pass
+            return True
+
+        enum_proc = WNDENUMPROC(_callback)
+        user32.EnumWindows(enum_proc, 0)
+        return len(signaled) > 0
+    except Exception:
+        return False
+
+
 # ── Auto-start (per-user registry Run key) ───────────────────────────────
 
 
