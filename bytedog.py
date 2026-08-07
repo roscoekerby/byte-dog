@@ -14,6 +14,7 @@ import time
 import platform
 import os
 import json
+import subprocess
 from datetime import datetime, timedelta
 from collections import deque
 import sys
@@ -2145,11 +2146,216 @@ Created with Python and psutil
         self.root.after(2000, self.update_guardian_tab)
 
     def create_services_tab(self, parent):
-        """STUB — filled in by a subagent. Windows services tab:
-        list name/display_name/status/start_type via psutil.win_service_iter(),
-        Start/Stop via `sc.exe` subprocess (CREATE_NO_WINDOW, no new deps)."""
-        tk.Label(parent, text="Services — not yet implemented", bg=self.colors['bg'],
-                 fg=self.colors['fg']).pack(padx=20, pady=20)
+        """Windows services tab: list name/display_name/status/start_type via
+        psutil.win_service_iter(), sortable/searchable, with Start/Stop via
+        `sc.exe` (background thread, confirmed, CREATE_NO_WINDOW so it never
+        flashes a console under pythonw — see gpu.py's history for why that
+        matters). Populated once via a background scan; manual Refresh only,
+        no auto-refresh timer."""
+        bg, fg = self.colors['bg'], self.colors['fg']
+
+        control_frame = ttk.Frame(parent)
+        control_frame.pack(fill='x', padx=10, pady=10)
+
+        tk.Button(control_frame, text="🔄 Refresh", bg=self.colors['button'], fg=fg,
+                  command=self.refresh_services).pack(side='left', padx=2)
+
+        tk.Button(control_frame, text="▶ Start", bg=self.colors['button'], fg=fg,
+                  command=self._services_start_selected).pack(side='left', padx=2)
+
+        tk.Button(control_frame, text="⏹ Stop", bg=self.colors['button'], fg=fg,
+                  command=self._services_stop_selected).pack(side='left', padx=2)
+
+        # Search box
+        tk.Label(control_frame, text="Search:", bg=bg, fg=fg).pack(side='left', padx=(20, 5))
+        self.services_search_var = tk.StringVar()
+        self.services_search_var.trace('w', lambda *args: self.filter_services())
+        search_entry = tk.Entry(control_frame, textvariable=self.services_search_var,
+                                bg=self.colors['button'], fg=fg, insertbackground=fg)
+        search_entry.pack(side='left')
+
+        # Frame for list and scrollbars
+        list_frame = ttk.Frame(parent)
+        list_frame.pack(fill='both', expand=True, padx=10, pady=(0, 10))
+
+        vscroll = ttk.Scrollbar(list_frame, orient='vertical')
+        vscroll.pack(side='right', fill='y')
+        hscroll = ttk.Scrollbar(list_frame, orient='horizontal')
+        hscroll.pack(side='bottom', fill='x')
+
+        columns = ('Name', 'Display Name', 'Status', 'Start Type')
+        self.services_tree = ttk.Treeview(list_frame, columns=columns, show='headings',
+                                          yscrollcommand=vscroll.set, xscrollcommand=hscroll.set)
+
+        widths = {'Name': 170, 'Display Name': 260, 'Status': 90, 'Start Type': 90}
+        for col in columns:
+            self.services_tree.heading(col, text=col, command=lambda c=col: self.sort_services(c))
+            self.services_tree.column(col, width=widths[col], minwidth=50,
+                                      stretch=(col == 'Display Name'),
+                                      anchor='w' if col in ('Name', 'Display Name') else 'center')
+
+        vscroll.config(command=self.services_tree.yview)
+        hscroll.config(command=self.services_tree.xview)
+        self.services_tree.pack(fill='both', expand=True)
+
+        # Colour running/stopped so state is obvious at a glance
+        self.services_tree.tag_configure('svc_running', foreground=self.colors['success'])
+        self.services_tree.tag_configure('svc_stopped', foreground='#777777')
+
+        # Sort/filter state — kept fully separate from the Processes tab's
+        # self.sort_column / self.process_tree so the two tabs never collide.
+        self._services_cache = []
+        self.services_sort_column = 'name'
+        self.services_sort_reverse = False
+
+        # Populate once via a background scan (enumerating ALL services can
+        # take a moment) — manual Refresh only, no auto-refresh timer, since
+        # the list changing mid-confirmation on Start/Stop would be risky.
+        self.refresh_services()
+
+    def refresh_services(self):
+        """Enumerate Windows services off the UI thread, then refresh the tree."""
+        if hasattr(self, 'status_label'):
+            self.status_label.config(text="Scanning services...", foreground=self.colors['warning'])
+
+        def _scan():
+            services = []
+            try:
+                for svc in psutil.win_service_iter():
+                    try:
+                        services.append(svc.as_dict())
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                        continue
+            except Exception as e:
+                print(f"Service scan error: {e}")
+            self.root.after(0, lambda: self._services_scan_done(services))
+
+        threading.Thread(target=_scan, daemon=True, name='ByteDogServiceScan').start()
+
+    def _services_scan_done(self, services):
+        """Runs on the Tk main thread once the background scan finishes."""
+        self._services_cache = services
+        self.update_services_list()
+        if hasattr(self, 'status_label'):
+            self.status_label.config(text=f"Found {len(services)} services", foreground=self.colors['success'])
+
+    def sort_services(self, column):
+        """Sort service list by column — mirrors sort_processes but with its
+        own state so it never touches the Processes tab's sort_column."""
+        col_map = {'Name': 'name', 'Display Name': 'display_name',
+                   'Status': 'status', 'Start Type': 'start_type'}
+
+        if column in col_map:
+            if self.services_sort_column == col_map[column]:
+                self.services_sort_reverse = not self.services_sort_reverse
+            else:
+                self.services_sort_column = col_map[column]
+                self.services_sort_reverse = False
+
+            self.update_services_list()
+
+    def filter_services(self):
+        """Filter service list based on search box."""
+        if hasattr(self, 'services_tree'):
+            self.update_services_list()
+
+    def update_services_list(self):
+        """Re-render the services tree from the cached scan, applying the
+        current search filter and sort column."""
+        if not hasattr(self, 'services_tree'):
+            return
+
+        for item in self.services_tree.get_children():
+            self.services_tree.delete(item)
+
+        services = list(self._services_cache)
+
+        search_term = self.services_search_var.get().lower() if hasattr(self, 'services_search_var') else ""
+        if search_term:
+            services = [s for s in services
+                        if search_term in (s.get('name') or '').lower()
+                        or search_term in (s.get('display_name') or '').lower()]
+
+        services.sort(key=lambda s: (s.get(self.services_sort_column) or ''),
+                      reverse=self.services_sort_reverse)
+
+        for svc in services:
+            status = svc.get('status', '')
+            if status == 'running':
+                tags = ('svc_running',)
+            elif status == 'stopped':
+                tags = ('svc_stopped',)
+            else:
+                tags = ()
+            self.services_tree.insert('', 'end', values=(
+                svc.get('name', ''),
+                svc.get('display_name', ''),
+                status,
+                svc.get('start_type', ''),
+            ), tags=tags)
+
+    def _services_selected(self):
+        """Return (name, display_name) of the selected service row, or None."""
+        if not hasattr(self, 'services_tree'):
+            return None
+        selection = self.services_tree.selection()
+        if not selection:
+            return None
+        item = self.services_tree.item(selection[0])
+        name, display_name = item['values'][0], item['values'][1]
+        return name, display_name
+
+    def _services_start_selected(self):
+        self._services_run_action('start')
+
+    def _services_stop_selected(self):
+        self._services_run_action('stop')
+
+    def _services_run_action(self, action):
+        """Confirm, then run `sc start|stop <name>` in a background thread
+        so the Tk mainloop never blocks. CREATE_NO_WINDOW is mandatory here —
+        this codebase has a documented history of console-flash bugs from
+        subprocess calls under pythonw (see gpu.py's docstring/history)."""
+        selected = self._services_selected()
+        if not selected:
+            return
+        name, display_name = selected
+
+        verb = 'Start' if action == 'start' else 'Stop'
+        if not messagebox.askyesno("Confirm",
+                                   f"{verb} service '{display_name}' ({name})?"):
+            return
+
+        if hasattr(self, 'status_label'):
+            self.status_label.config(text=f"{verb}ing {name}...", foreground=self.colors['warning'])
+
+        def _worker():
+            try:
+                result = subprocess.run(
+                    ['sc', action, name],
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    capture_output=True, text=True,
+                )
+                ok = result.returncode == 0
+                detail = (result.stdout or '').strip() if ok else \
+                    ((result.stderr or '').strip() or (result.stdout or '').strip())
+            except Exception as e:
+                ok, detail = False, str(e)
+            self.root.after(0, lambda: self._services_action_done(action, name, ok, detail))
+
+        threading.Thread(target=_worker, daemon=True, name='ByteDogServiceAction').start()
+
+    def _services_action_done(self, action, name, ok, detail):
+        """Runs on the Tk main thread once sc.exe returns. 'Access is denied'
+        is an expected/common failure when not elevated, not a crash."""
+        verb = 'Started' if action == 'start' else 'Stopped'
+        if ok:
+            self.status_label.config(text=f"{verb} {name}", foreground=self.colors['success'])
+        else:
+            self.status_label.config(text=f"Failed to {action} {name}", foreground=self.colors['error'])
+            messagebox.showerror("Service Action Failed",
+                                 detail or f"Could not {action} '{name}'.")
+        self.refresh_services()
 
     def create_startup_tab(self, parent):
         """STUB — filled in by a subagent. Startup items tab: enumerate
