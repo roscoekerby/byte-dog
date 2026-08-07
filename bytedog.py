@@ -26,6 +26,7 @@ from guardian import (
     fast_memory_snapshot, enrich_chromium, select_targets, group_by_name,
     harden_self, install_autostart, uninstall_autostart, autostart_installed,
     is_admin, relaunch_elevated, enable_debug_privilege, protected_reason,
+    graceful_close_process,
 )
 
 # GPU backend: NVML via nvidia-ml-py + PDH per-process VRAM (both in-process,
@@ -225,10 +226,23 @@ class ProcessManager:
     """Process management functionality"""
 
     @staticmethod
-    def kill_process(pid):
-        """Kill a process by PID"""
+    def kill_process(pid, graceful=True):
+        """Kill a process by PID. When graceful=True (the default, used by
+        manual kill actions), first posts WM_CLOSE to the target's visible
+        top-level windows and gives it up to ~3s to exit on its own, so a
+        window with unsaved changes gets the same chance to prompt the user
+        that Task Manager's "End Task" gives it, before the hard kill below.
+        graceful=False skips straight to the hard kill; the Guardian's
+        automatic emergency-kill path always passes this, since a live RAM
+        thrash leaves no time for a multi-second grace period per victim."""
         try:
             proc = psutil.Process(pid)
+            if graceful:
+                if graceful_close_process(pid):
+                    for _ in range(10):
+                        if not proc.is_running():
+                            return True
+                        time.sleep(0.3)
             proc.terminate()
             time.sleep(0.5)
             if proc.is_running():
@@ -1889,7 +1903,10 @@ Created with Python and psutil
         for t in targets:
             pid, name, gb = t['pid'], t['name'], t['rss'] / (1024 ** 3)
             if tier == 'kill':
-                if self.process_manager.kill_process(pid):
+                # graceful=False: this is the Guardian's automatic emergency
+                # kill during a live RAM thrash — no time for a WM_CLOSE
+                # grace period per victim (see ProcessManager.kill_process).
+                if self.process_manager.kill_process(pid, graceful=False):
                     self.guardian.engine.record_kill(time.time())
                     self.guardian.suspended.pop(pid, None)
                     msg = f"Killed {name} (PID {pid}, {gb:.1f} GB freed)"
