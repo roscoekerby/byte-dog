@@ -26,7 +26,7 @@ from guardian import (
     fast_memory_snapshot, enrich_chromium, select_targets, group_by_name,
     harden_self, install_autostart, uninstall_autostart, autostart_installed,
     is_admin, relaunch_elevated, enable_debug_privilege, protected_reason,
-    graceful_close_process,
+    graceful_close_process, collect_window_titles,
 )
 
 # GPU backend: NVML via nvidia-ml-py + PDH per-process VRAM (both in-process,
@@ -159,6 +159,7 @@ class SystemMonitor:
                 pinfo['memory_bytes'] = 0
                 pinfo['gpu_mb'] = 0.0
                 pinfo['disk_io_mb'] = 0.0
+                pinfo['window_title'] = ''
                 pinfo['status'] = '—'
                 processes.append(pinfo)
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
@@ -179,6 +180,11 @@ class SystemMonitor:
         using the fresh, single-use instances process_iter() yields each time."""
         total = self._total_ram
         gpu_vram = gpu_backend.get_process_vram() if GPU_AVAILABLE else {}
+        # One system-wide window sweep, not one per process — see
+        # guardian.collect_window_titles for why only a browser's main
+        # window-owning process (not each sandboxed renderer/tab) ever gets
+        # an entry here.
+        window_titles = collect_window_titles()
         enriched = []
         live_pids = set()
         for proc in psutil.process_iter(['pid', 'name', 'memory_percent', 'ppid'], ad_value=0):
@@ -223,6 +229,7 @@ class SystemMonitor:
                 except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, NotImplementedError):
                     pinfo['disk_io_mb'] = 0.0
 
+                pinfo['window_title'] = '; '.join(window_titles.get(pid, []))
                 pinfo['status'] = '—'
                 enriched.append(pinfo)
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
@@ -961,7 +968,7 @@ class ByteDogApp:
         # Treeview for processes — 'tree headings' (not plain 'headings') so
         # the '#0' tree column renders with expand arrows, letting us group
         # child processes under their parent (see update_process_list).
-        columns = ('PID', 'CPU %', 'Memory %', 'Disk I/O', 'GPU MB', 'Status')
+        columns = ('PID', 'CPU %', 'Memory %', 'Disk I/O', 'GPU MB', 'Status', 'Window')
         self.process_tree = ttk.Treeview(list_frame, columns=columns, show='tree headings',
                                          yscrollcommand=vscroll.set, xscrollcommand=hscroll.set)
 
@@ -974,14 +981,17 @@ class ByteDogApp:
         # Explicit width for every column (an unmatched column silently keeps
         # ttk's ~200px default) — sized to fit the 620px detailed-view window
         # without clipping; hscroll above is the fallback if the window is
-        # resized narrower than that (now leaned on more, since Disk I/O adds
-        # ~85px on top of the original 585px total).
-        widths = {'PID': 70, 'CPU %': 70, 'Memory %': 85, 'Disk I/O': 85, 'GPU MB': 80, 'Status': 80}
+        # resized narrower than that (already leaned on for Disk I/O; Window
+        # pushes further into scroll territory, same tradeoff, same reason —
+        # window titles are long and most processes don't have one at all,
+        # so it's not worth shrinking the always-populated columns for it).
+        widths = {'PID': 70, 'CPU %': 70, 'Memory %': 85, 'Disk I/O': 85, 'GPU MB': 80,
+                 'Status': 80, 'Window': 260}
         for col in columns:
             self.process_tree.heading(col, text=col, command=lambda c=col: self.sort_processes(c))
             self.process_tree.column(col, width=widths[col], minwidth=50,
                                      stretch=False,
-                                     anchor='w' if col == 'Status' else 'center')
+                                     anchor='w' if col in ('Status', 'Window') else 'center')
 
         vscroll.config(command=self.process_tree.yview)
         hscroll.config(command=self.process_tree.xview)
@@ -1129,7 +1139,7 @@ class ByteDogApp:
         """Sort process list by column"""
         col_map = {'PID': 'pid', 'Name': 'name', 'CPU %': 'cpu_percent',
                    'Memory %': 'memory_percent', 'Disk I/O': 'disk_io_mb',
-                   'GPU MB': 'gpu_mb', 'Status': 'status'}
+                   'GPU MB': 'gpu_mb', 'Status': 'status', 'Window': 'window_title'}
 
         if column in col_map:
             if self.sort_column == col_map[column]:
@@ -1343,7 +1353,8 @@ class ByteDogApp:
             f"{proc.get('memory_percent', 0):.1f}",
             f"{proc.get('disk_io_mb', 0):.1f}",
             f"{proc.get('gpu_mb', 0):.0f}",
-            proc['status']
+            proc['status'],
+            (proc.get('window_title') or '')[:80]
         ), tags=tags)
 
     def update_process_list(self):
@@ -1374,7 +1385,14 @@ class ByteDogApp:
         # fully correct hierarchical sort — top-level rows and each parent's
         # children independently follow the sort key, but a parent's rank
         # isn't computed from its children's values).
-        processes.sort(key=lambda x: x.get(self.sort_column, 0) or 0, reverse=self.sort_reverse)
+        #
+        # `x.get(col, 0)` only — no `or 0` fallback: every pinfo field is
+        # always populated with a real default (0.0 for numeric fields, ''
+        # for window_title/status), so the `or 0` used to be a no-op for
+        # numeric columns but silently coerced an empty (falsy) window_title
+        # string into int 0 — mixing int and str in the same sort crashes
+        # with TypeError the instant two rows differ (one blank, one titled).
+        processes.sort(key=lambda x: x.get(self.sort_column, 0), reverse=self.sort_reverse)
 
         # Cap for performance BEFORE tree-building, on the flat sorted list
         # (top 100 overall) — not per-branch, so grouping can't inflate the

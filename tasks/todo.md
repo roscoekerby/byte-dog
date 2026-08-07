@@ -320,3 +320,64 @@ during its own verification pass). Their correctness rests on code review
 Worth the user trying Start/Stop on a low-stakes service (e.g. Print
 Spooler) and a startup-item toggle themselves before trusting it on
 anything that matters.
+
+# Feature: Window column (labels a process with its open window titles)
+
+User asked whether Chrome processes could be labeled by tab (like Task
+Manager). Live-tested `EnumWindows` against a real 47-process Chrome
+session first rather than assuming: only 1 PID (the browser-UI process)
+owns any titled window — the ~46 sandboxed renderer/GPU/utility children
+own none, since real per-renderer tab attribution needs a private
+Chromium<->Task-Manager IPC channel with no public equivalent. Told the
+user the honest scope before building; they confirmed the partial version.
+
+## Plan
+- [x] `guardian.py`: `collect_window_titles()` — one system-wide
+      `EnumWindows` sweep -> `{pid: [titles]}`, not one sweep per process.
+      Turned out more broadly useful than just Chrome: correctly labels
+      Explorer windows, Word's open document, Windows Terminal's open tabs,
+      any multi-window app, not Chrome-specific
+- [x] `SystemMonitor.scan_process_memory()`: one `collect_window_titles()`
+      call per scan, attach `pinfo['window_title']` (semicolon-joined if a
+      process owns multiple windows); `get_process_list()`'s fast path
+      defaults to `''`
+- [x] New "Window" column: `create_process_list` (260px, left-anchored,
+      relies on the existing horizontal-scrollbar fallback like Disk I/O
+      did), `sort_processes`'s `col_map`, `_insert_process_row` (title
+      truncated to 80 chars in the cell)
+- [x] **Bug caught before it shipped**, not after: the generic sort key
+      (`x.get(self.sort_column, 0) or 0`) coerced an empty `window_title`
+      string to `int 0` via the `or 0` fallback — sorting by the Window
+      column would crash with `TypeError: '<' not supported between
+      instances of 'str' and 'int'` the instant one blank and one titled
+      row were compared (guaranteed, since almost every process has no
+      window). Reproduced in isolation first, then fixed by dropping the
+      `or 0` (every pinfo field already has a real, always-populated
+      default, so it was a no-op for every numeric column anyway)
+- [x] `python -m py_compile` + `pytest -q` (40/40)
+- [x] End-to-end data verification (not just "doesn't crash"): instantiated
+      `SystemMonitor` directly and called `scan_process_memory()` against
+      the real live desktop — confirmed correct titles attributed to the
+      correct PIDs (Chrome's 4 open tabs, Explorer's 5 windows, Word's open
+      doc, Windows Terminal's 4 tabs, ByteDog's own already-running window)
+- [x] Live smoke test: 20s background launch, no traceback (covers initial
+      autoscan + the 15s periodic re-scan tick, both now exercising the new
+      column)
+
+## Review
+
+**What changed and why:** ships the honestly-scoped version discussed —
+labels whichever process owns a visible OS window with that window's
+title(s), which for Chrome means "which chrome.exe is your actual browser
+and what's the active tab in each open window," not "which chrome.exe is
+running which background tab" (not achievable without Chromium-internal
+IPC). Landed as a genuinely general feature rather than a Chrome-specific
+hack, since the underlying mechanism (EnumWindows) doesn't care what kind
+of process owns the window — Explorer/Word/Terminal all benefit too.
+
+The sort-crash bug is a good example of the value of testing with
+realistic *data shape*, not just "does it run": `py_compile` and a
+no-interaction smoke test both would have missed it, since it only
+triggers when a user actually clicks the Window column header with a mix
+of blank and titled rows present — which, on a real desktop, is the
+common case, not an edge case.

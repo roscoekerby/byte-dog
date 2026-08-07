@@ -598,6 +598,69 @@ def graceful_close_process(pid: int, timeout: float = 3.0) -> bool:
         return False
 
 
+# ── Window-title attribution (Processes tab, best-effort labeling) ───────
+# Chrome/Edge-style multi-process browsers put ~1 real OS window per open
+# browser window (title = its active tab), owned by the single browser-UI
+# process; the dozens of sandboxed renderer/GPU/utility child processes own
+# no window of their own and simply won't appear in the returned map. This
+# was confirmed live (not assumed): EnumWindows across a real 47-process
+# Chrome session found titled windows on exactly one PID. So this labels
+# "which process owns your visible windows and what's showing in them", not
+# "which process is running which background tab" — that fuller mapping
+# needs a private Chromium<->Task Manager IPC channel with no public
+# equivalent, not just a different Win32 call.
+
+
+def collect_window_titles() -> dict:
+    """One EnumWindows sweep -> {pid: [window titles]} for every visible,
+    titled top-level window on the system. Windows-only; never raises,
+    returns {} on any failure or non-Windows platform. Call once per scan
+    and look up by pid — much cheaper than one EnumWindows per process."""
+    if sys.platform != 'win32':
+        return {}
+    try:
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+        user32.EnumWindows.restype = wintypes.BOOL
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        user32.GetWindowTextLengthW.restype = ctypes.c_int
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetWindowTextW.restype = ctypes.c_int
+
+        titles_by_pid = {}
+
+        def _callback(hwnd, lparam):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length <= 0:
+                    return True
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                title = buf.value.strip()
+                if not title:
+                    return True
+                owner_pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+                titles_by_pid.setdefault(owner_pid.value, []).append(title)
+            except Exception:
+                pass
+            return True
+
+        enum_proc = WNDENUMPROC(_callback)
+        user32.EnumWindows(enum_proc, 0)
+        return titles_by_pid
+    except Exception:
+        return {}
+
+
 # ── Auto-start (per-user registry Run key) ───────────────────────────────
 
 
