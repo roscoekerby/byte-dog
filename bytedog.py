@@ -17,6 +17,7 @@ import json
 import subprocess
 from datetime import datetime, timedelta
 from collections import deque
+from pathlib import Path
 import sys
 import queue
 
@@ -32,6 +33,15 @@ from guardian import (
 import gpu as gpu_backend
 
 GPU_AVAILABLE = gpu_backend.gpu_available()
+
+# Registry paths for the Startup tab. Same subpath convention as
+# guardian.AUTOSTART_KEY_PATH; StartupApproved holds the enable/disable
+# flags Task Manager uses (reverse-engineered, not a public API) and always
+# lives under HKCU regardless of whether the Run entry itself is HKCU or
+# HKLM — see create_startup_tab / _startup_* helpers below.
+_STARTUP_RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_STARTUP_APPROVED_RUN_PATH = r"Software\Microsoft\Windows\CurrentVersion\StartupApproved\Run"
+_STARTUP_APPROVED_FOLDER_PATH = r"Software\Microsoft\Windows\CurrentVersion\StartupApproved\StartupFolder"
 
 # Hide console window on Windows when running as EXE
 if platform.system() == 'Windows' and getattr(sys, 'frozen', False):
@@ -2358,12 +2368,269 @@ Created with Python and psutil
         self.refresh_services()
 
     def create_startup_tab(self, parent):
-        """STUB — filled in by a subagent. Startup items tab: enumerate
-        HKCU/HKLM ...\\CurrentVersion\\Run plus the Startup folder, with
-        enable/disable via the StartupApproved\\Run flag (same mechanism
-        real Task Manager uses, not a Run-key delete/rewrite)."""
-        tk.Label(parent, text="Startup — not yet implemented", bg=self.colors['bg'],
-                 fg=self.colors['fg']).pack(padx=20, pady=20)
+        """Startup items tab: lists Run-key entries (HKCU + HKLM) and
+        Startup-folder items (per-user + all-users), with enable/disable via
+        the StartupApproved registry flag — the same mechanism real Task
+        Manager uses. The underlying Run value / shortcut file is never
+        touched, so toggling stays non-destructive and reversible."""
+        bg = self.colors['bg']
+        fg = self.colors['fg']
+
+        control_frame = ttk.Frame(parent)
+        control_frame.pack(fill='x', padx=10, pady=10)
+
+        tk.Button(control_frame, text="🔄 Refresh", bg=self.colors['button'], fg=fg,
+                  command=self._startup_refresh).pack(side='left', padx=2)
+
+        self.startup_toggle_btn = tk.Button(control_frame, text="Enable/Disable",
+                                            bg=self.colors['button'], fg=fg,
+                                            state='disabled', command=self._startup_toggle_selected)
+        self.startup_toggle_btn.pack(side='left', padx=2)
+
+        tk.Label(control_frame, text="Search:", bg=bg, fg=fg).pack(side='left', padx=(20, 5))
+        self.startup_search_var = tk.StringVar()
+        self.startup_search_var.trace('w', lambda *args: self._startup_apply_filter())
+        tk.Entry(control_frame, textvariable=self.startup_search_var, bg=self.colors['button'],
+                 fg=fg, insertbackground=fg).pack(side='left')
+
+        # Explains why the toggle button is disabled for the current
+        # selection (e.g. an HKLM entry while not running elevated).
+        self.startup_status_label = tk.Label(control_frame, text="", bg=bg,
+                                             fg=self.colors['warning'], font=('Arial', 8))
+        self.startup_status_label.pack(side='left', padx=(20, 0))
+
+        list_frame = ttk.Frame(parent)
+        list_frame.pack(fill='both', expand=True, padx=10, pady=(0, 10))
+
+        vscroll = ttk.Scrollbar(list_frame, orient='vertical')
+        vscroll.pack(side='right', fill='y')
+        hscroll = ttk.Scrollbar(list_frame, orient='horizontal')
+        hscroll.pack(side='bottom', fill='x')
+
+        columns = ('Name', 'Command', 'Source', 'Status')
+        self.startup_tree = ttk.Treeview(list_frame, columns=columns, show='headings',
+                                         yscrollcommand=vscroll.set, xscrollcommand=hscroll.set)
+        widths = {'Name': 160, 'Command': 300, 'Source': 110, 'Status': 90}
+        for col in columns:
+            self.startup_tree.heading(col, text=col)
+            self.startup_tree.column(col, width=widths[col], minwidth=60,
+                                     stretch=(col == 'Command'),
+                                     anchor='w' if col != 'Status' else 'center')
+        vscroll.config(command=self.startup_tree.yview)
+        hscroll.config(command=self.startup_tree.xview)
+        self.startup_tree.pack(fill='both', expand=True)
+
+        # Disabled entries greyed out; admin-required rows called out in the
+        # warning color so it's obvious at a glance which ones can't be
+        # toggled without relaunching elevated.
+        self.startup_tree.tag_configure('disabled', foreground='#777777')
+        self.startup_tree.tag_configure('admin_required', foreground=self.colors['warning'])
+
+        self.startup_tree.bind('<<TreeviewSelect>>', self._startup_on_select)
+        self.startup_tree.bind('<Button-3>', self._startup_show_menu)
+
+        self.startup_context_menu = tk.Menu(self.root, tearoff=0, bg=self.colors['button'], fg=fg)
+        self.startup_context_menu.add_command(label="Toggle Enable/Disable",
+                                              command=self._startup_toggle_selected)
+
+        self._startup_items = {}  # iid -> item dict, rebuilt on every refresh
+        self._startup_refresh()
+
+    def _startup_collect_items(self):
+        """Enumerate startup entries from the Run keys (HKCU + HKLM) and the
+        Startup folders (per-user + all-users). Never raises — a missing key,
+        missing folder, or permissions error just means that source
+        contributes nothing, matching guardian.py's degrade-gracefully
+        convention for registry access."""
+        import winreg
+        items = []
+        items.extend(self._startup_read_run_key(winreg.HKEY_CURRENT_USER, 'Registry HKCU'))
+        items.extend(self._startup_read_run_key(winreg.HKEY_LOCAL_MACHINE, 'Registry HKLM'))
+        items.extend(self._startup_read_folder(
+            Path(os.environ.get('APPDATA', '')) / 'Microsoft' / 'Windows' / 'Start Menu' / 'Programs' / 'Startup',
+            'Startup Folder'))
+        items.extend(self._startup_read_folder(
+            Path(os.environ.get('PROGRAMDATA', '')) / 'Microsoft' / 'Windows' / 'Start Menu' / 'Programs' / 'Startup',
+            'Startup Folder'))
+        return items
+
+    def _startup_read_run_key(self, hive, source_label):
+        """Enumerate all values under a Run key. Returns [] on any OSError
+        (key missing, access denied, etc.) rather than raising to the UI."""
+        import winreg
+        items = []
+        try:
+            with winreg.OpenKey(hive, _STARTUP_RUN_KEY_PATH, 0, winreg.KEY_READ) as key:
+                index = 0
+                while True:
+                    try:
+                        name, value, _ = winreg.EnumValue(key, index)
+                    except OSError:
+                        break
+                    items.append({
+                        'name': name,
+                        'command': str(value),
+                        'source': source_label,
+                        'value_name': name,
+                        'folder': False,
+                        'requires_admin': source_label == 'Registry HKLM',
+                        'enabled': self._startup_is_approved(name, folder=False),
+                    })
+                    index += 1
+        except OSError:
+            pass
+        return items
+
+    def _startup_read_folder(self, folder_path, source_label):
+        """List .lnk/.exe filenames directly in a Startup folder. Shortcut
+        targets are not resolved (would need COM/pywin32 — out of scope, no
+        new pip dependencies)."""
+        items = []
+        try:
+            if not folder_path.is_dir():
+                return items
+            for entry in folder_path.iterdir():
+                if entry.is_file() and entry.suffix.lower() in ('.lnk', '.exe'):
+                    items.append({
+                        'name': entry.name,
+                        'command': entry.name,
+                        'source': source_label,
+                        'value_name': entry.name,
+                        'folder': True,
+                        'requires_admin': False,
+                        'enabled': self._startup_is_approved(entry.name, folder=True),
+                    })
+        except OSError:
+            pass
+        return items
+
+    def _startup_is_approved(self, value_name, folder):
+        """True unless the StartupApproved flag for this entry has its first
+        byte set to 0x02 (Task Manager's documented 'disabled' marker).
+        Entries with no StartupApproved value yet default to enabled — that
+        is their real-world state until someone toggles them the first
+        time."""
+        import winreg
+        path = _STARTUP_APPROVED_FOLDER_PATH if folder else _STARTUP_APPROVED_RUN_PATH
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_READ) as key:
+                data, _ = winreg.QueryValueEx(key, value_name)
+        except OSError:
+            return True
+        if not data:
+            return True
+        return data[0] != 0x02
+
+    def _startup_set_approved_state(self, value_name, folder, enable):
+        """Write the StartupApproved flag for `value_name`, preserving any
+        trailing bytes already present (Task Manager stamps a timestamp
+        there; Explorer doesn't validate it, so zero-filling on first write
+        is fine). Only the StartupApproved value is touched — never the Run
+        value or the Startup-folder file — so this is always reversible.
+        Returns (ok, message), never raises."""
+        import winreg
+        path = _STARTUP_APPROVED_FOLDER_PATH if folder else _STARTUP_APPROVED_RUN_PATH
+        try:
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_ALL_ACCESS) as key:
+                try:
+                    existing, _ = winreg.QueryValueEx(key, value_name)
+                except OSError:
+                    existing = b''
+                data = bytearray(existing) if existing else bytearray(12)
+                if len(data) < 12:
+                    data.extend(b'\x00' * (12 - len(data)))
+                data[0] = 0x06 if enable else 0x02
+                winreg.SetValueEx(key, value_name, 0, winreg.REG_BINARY, bytes(data))
+            return True, 'updated'
+        except OSError as e:
+            return False, f'registry write failed: {e}'
+
+    def _startup_refresh(self):
+        """(Re)build the startup item list from the registry and Startup
+        folders. These are all fast reads (a handful of registry values plus
+        two directory listings) so this runs synchronously on the UI
+        thread — no background thread needed."""
+        if not hasattr(self, 'startup_tree'):
+            return
+        items = self._startup_collect_items()
+        self._startup_items = {}
+        for item in items:
+            iid = f"{item['source']}::{item['value_name']}"
+            self._startup_items[iid] = item
+        self._startup_apply_filter()
+
+    def _startup_apply_filter(self):
+        """Redraw the tree from self._startup_items, applying the search box
+        filter (matches Name or Command) if any text is present."""
+        if not hasattr(self, 'startup_tree'):
+            return
+        for row in self.startup_tree.get_children():
+            self.startup_tree.delete(row)
+
+        search = self.startup_search_var.get().lower() if hasattr(self, 'startup_search_var') else ''
+        for iid, item in sorted(self._startup_items.items(), key=lambda kv: kv[1]['name'].lower()):
+            if search and search not in item['name'].lower() and search not in item['command'].lower():
+                continue
+            status = 'Enabled' if item['enabled'] else 'Disabled'
+            tags = []
+            if not item['enabled']:
+                tags.append('disabled')
+            if item['requires_admin'] and not is_admin():
+                tags.append('admin_required')
+            self.startup_tree.insert('', 'end', iid=iid, values=(
+                item['name'], item['command'], item['source'], status,
+            ), tags=tuple(tags))
+        self._startup_on_select()
+
+    def _startup_on_select(self, event=None):
+        """Enable/disable the toggle button (and explain why) based on
+        whether the current selection is an HKLM entry while not running
+        elevated — real Task Manager also requires admin for machine-wide
+        Run entries."""
+        if not hasattr(self, 'startup_tree') or not hasattr(self, 'startup_toggle_btn'):
+            return
+        selection = self.startup_tree.selection()
+        item = self._startup_items.get(selection[0]) if selection else None
+        if not item:
+            self.startup_toggle_btn.config(state='disabled')
+            self.startup_status_label.config(text='')
+        elif item['requires_admin'] and not is_admin():
+            self.startup_toggle_btn.config(state='disabled')
+            self.startup_status_label.config(text='Requires admin to modify machine-wide entries')
+        else:
+            self.startup_toggle_btn.config(state='normal')
+            self.startup_status_label.config(text='')
+
+    def _startup_show_menu(self, event):
+        """Right-click context menu — select the row under the cursor first
+        so the menu action applies to it."""
+        iid = self.startup_tree.identify('item', event.x, event.y)
+        if iid:
+            self.startup_tree.selection_set(iid)
+            self._startup_on_select()
+            self.startup_context_menu.post(event.x_root, event.y_root)
+
+    def _startup_toggle_selected(self):
+        """Flip the StartupApproved flag for the selected item and refresh
+        the list to reflect the new state."""
+        selection = self.startup_tree.selection()
+        if not selection:
+            return
+        item = self._startup_items.get(selection[0])
+        if not item:
+            return
+        if item['requires_admin'] and not is_admin():
+            messagebox.showinfo(
+                "Admin required",
+                "Modifying machine-wide (HKLM) startup entries requires running "
+                "ByteDog as Administrator.")
+            return
+        ok, message = self._startup_set_approved_state(
+            item['value_name'], item['folder'], not item['enabled'])
+        if not ok:
+            messagebox.showerror("Startup", f"Could not update startup entry: {message}")
+            return
+        self._startup_refresh()
 
     def create_users_tab(self, parent):
         """STUB — filled in by a subagent. Logged-on sessions tab, read-only:
