@@ -760,6 +760,21 @@ class ByteDogApp:
         notebook.add(guardian_tab, text='Guardian')
         self.create_guardian_tab(guardian_tab)
 
+        # Services tab
+        services_tab = ttk.Frame(notebook)
+        notebook.add(services_tab, text='Services')
+        self.create_services_tab(services_tab)
+
+        # Startup tab
+        startup_tab = ttk.Frame(notebook)
+        notebook.add(startup_tab, text='Startup')
+        self.create_startup_tab(startup_tab)
+
+        # Users tab
+        users_tab = ttk.Frame(notebook)
+        notebook.add(users_tab, text='Users')
+        self.create_users_tab(users_tab)
+
     def create_menu(self):
         """Create menu bar"""
         menubar = tk.Menu(self.root, bg=self.colors['button'], fg=self.colors['fg'])
@@ -2128,6 +2143,27 @@ Created with Python and psutil
 
         # Defer first update — don't block main thread during setup
         self.root.after(2000, self.update_guardian_tab)
+
+    def create_services_tab(self, parent):
+        """STUB — filled in by a subagent. Windows services tab:
+        list name/display_name/status/start_type via psutil.win_service_iter(),
+        Start/Stop via `sc.exe` subprocess (CREATE_NO_WINDOW, no new deps)."""
+        tk.Label(parent, text="Services — not yet implemented", bg=self.colors['bg'],
+                 fg=self.colors['fg']).pack(padx=20, pady=20)
+
+    def create_startup_tab(self, parent):
+        """STUB — filled in by a subagent. Startup items tab: enumerate
+        HKCU/HKLM ...\\CurrentVersion\\Run plus the Startup folder, with
+        enable/disable via the StartupApproved\\Run flag (same mechanism
+        real Task Manager uses, not a Run-key delete/rewrite)."""
+        tk.Label(parent, text="Startup — not yet implemented", bg=self.colors['bg'],
+                 fg=self.colors['fg']).pack(padx=20, pady=20)
+
+    def create_users_tab(self, parent):
+        """STUB — filled in by a subagent. Logged-on sessions tab, read-only:
+        list via psutil.users() (name/terminal/host/started)."""
+        tk.Label(parent, text="Users — not yet implemented", bg=self.colors['bg'],
+                 fg=self.colors['fg']).pack(padx=20, pady=20)
 
     def _toggle_guardian(self):
         self.guardian.enabled = self.guardian_enabled_var.get()
