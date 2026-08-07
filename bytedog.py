@@ -2633,10 +2633,55 @@ Created with Python and psutil
         self._startup_refresh()
 
     def create_users_tab(self, parent):
-        """STUB — filled in by a subagent. Logged-on sessions tab, read-only:
-        list via psutil.users() (name/terminal/host/started)."""
-        tk.Label(parent, text="Users — not yet implemented", bg=self.colors['bg'],
-                 fg=self.colors['fg']).pack(padx=20, pady=20)
+        """Logged-on sessions tab, read-only: lists who's logged on via
+        psutil.users(). No logoff/disconnect action is offered on purpose —
+        matches this app's risk-averse posture around disruptive actions."""
+        # Control buttons
+        control_frame = ttk.Frame(parent)
+        control_frame.pack(fill='x', padx=10, pady=10)
+
+        tk.Button(control_frame, text="🔄 Refresh", bg=self.colors['button'], fg=self.colors['fg'],
+                  command=self.refresh_users).pack(side='left', padx=2)
+
+        # Frame for list and scrollbar
+        list_frame = ttk.Frame(parent)
+        list_frame.pack(fill='both', expand=True, padx=10, pady=(0, 10))
+
+        vscroll = ttk.Scrollbar(list_frame, orient='vertical')
+        vscroll.pack(side='right', fill='y')
+
+        columns = ('Username', 'Terminal/Session', 'Host', 'Logged In Since')
+        self.users_tree = ttk.Treeview(list_frame, columns=columns, show='headings',
+                                       yscrollcommand=vscroll.set)
+
+        widths = {'Username': 140, 'Terminal/Session': 140, 'Host': 140, 'Logged In Since': 160}
+        for col in columns:
+            self.users_tree.heading(col, text=col)
+            self.users_tree.column(col, width=widths[col], minwidth=50,
+                                   stretch=(col == 'Host'), anchor='w')
+
+        vscroll.config(command=self.users_tree.yview)
+        self.users_tree.pack(fill='both', expand=True)
+
+        self._users_populate()
+
+    def _users_populate(self):
+        """Fill self.users_tree with the current logged-on sessions."""
+        for row in self.users_tree.get_children():
+            self.users_tree.delete(row)
+
+        for session in psutil.users():
+            since = datetime.fromtimestamp(session.started).strftime('%Y-%m-%d %H:%M:%S')
+            self.users_tree.insert('', 'end', values=(
+                session.name,
+                session.terminal or '-',
+                session.host or '-',
+                since,
+            ))
+
+    def refresh_users(self):
+        """Manual refresh handler for the Users tab's Refresh button."""
+        self._users_populate()
 
     def _toggle_guardian(self):
         self.guardian.enabled = self.guardian_enabled_var.get()
