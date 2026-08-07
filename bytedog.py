@@ -136,15 +136,17 @@ class SystemMonitor:
             return self.process_cache
 
         processes = []
-        for proc in psutil.process_iter(['pid', 'name'], ad_value=None):
+        for proc in psutil.process_iter(['pid', 'name', 'ppid'], ad_value=None):
             try:
                 pinfo = proc.info
                 if pinfo.get('name') is None:
                     continue
+                pinfo['ppid'] = pinfo.get('ppid') or 0
                 pinfo['cpu_percent'] = 0.0
                 pinfo['memory_percent'] = 0.0
                 pinfo['memory_bytes'] = 0
                 pinfo['gpu_mb'] = 0.0
+                pinfo['disk_io_mb'] = 0.0
                 pinfo['status'] = '—'
                 processes.append(pinfo)
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
@@ -167,12 +169,13 @@ class SystemMonitor:
         gpu_vram = gpu_backend.get_process_vram() if GPU_AVAILABLE else {}
         enriched = []
         live_pids = set()
-        for proc in psutil.process_iter(['pid', 'name', 'memory_percent'], ad_value=0):
+        for proc in psutil.process_iter(['pid', 'name', 'memory_percent', 'ppid'], ad_value=0):
             try:
                 pinfo = proc.info
                 pid = pinfo['pid']
                 if pinfo.get('name') is None:
                     continue
+                pinfo['ppid'] = pinfo.get('ppid') or 0
                 live_pids.add(pid)
 
                 handle = self._proc_handles.get(pid)
@@ -194,6 +197,20 @@ class SystemMonitor:
                 pinfo['cpu_percent'] = cpu_pct or 0.0
                 pinfo['memory_bytes'] = int((pinfo.get('memory_percent') or 0) / 100.0 * total)
                 pinfo['gpu_mb'] = gpu_vram.get(pid, 0.0)
+
+                # Same persistent handle as cpu_percent (not the throwaway
+                # `proc` from process_iter) so this stays consistent with the
+                # cpu_percent caching contract above. io_counters() reports
+                # cumulative bytes since process start; AccessDenied is the
+                # common case on Windows without admin rights, and some
+                # processes/platforms don't support it at all — both degrade
+                # to 0.0 rather than dropping the row or crashing the scan.
+                try:
+                    io = handle.io_counters()
+                    pinfo['disk_io_mb'] = (io.read_bytes + io.write_bytes) / (1024 * 1024)
+                except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, NotImplementedError):
+                    pinfo['disk_io_mb'] = 0.0
+
                 pinfo['status'] = '—'
                 enriched.append(pinfo)
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
@@ -916,21 +933,30 @@ class ByteDogApp:
         hscroll = ttk.Scrollbar(list_frame, orient='horizontal')
         hscroll.pack(side='bottom', fill='x')
 
-        # Treeview for processes
-        columns = ('PID', 'Name', 'CPU %', 'Memory %', 'GPU MB', 'Status')
-        self.process_tree = ttk.Treeview(list_frame, columns=columns, show='headings',
+        # Treeview for processes — 'tree headings' (not plain 'headings') so
+        # the '#0' tree column renders with expand arrows, letting us group
+        # child processes under their parent (see update_process_list).
+        columns = ('PID', 'CPU %', 'Memory %', 'Disk I/O', 'GPU MB', 'Status')
+        self.process_tree = ttk.Treeview(list_frame, columns=columns, show='tree headings',
                                          yscrollcommand=vscroll.set, xscrollcommand=hscroll.set)
+
+        # Name lives in the special '#0' tree column (not in `columns`) so
+        # the expand/collapse arrow and hierarchy indentation have somewhere
+        # to render — see update_process_list's insert() calls (text=name).
+        self.process_tree.heading('#0', text='Name', command=lambda: self.sort_processes('Name'))
+        self.process_tree.column('#0', width=220, minwidth=100, stretch=True, anchor='w')
 
         # Explicit width for every column (an unmatched column silently keeps
         # ttk's ~200px default) — sized to fit the 620px detailed-view window
         # without clipping; hscroll above is the fallback if the window is
-        # resized narrower than that.
-        widths = {'PID': 70, 'Name': 200, 'CPU %': 70, 'Memory %': 85, 'GPU MB': 80, 'Status': 80}
+        # resized narrower than that (now leaned on more, since Disk I/O adds
+        # ~85px on top of the original 585px total).
+        widths = {'PID': 70, 'CPU %': 70, 'Memory %': 85, 'Disk I/O': 85, 'GPU MB': 80, 'Status': 80}
         for col in columns:
             self.process_tree.heading(col, text=col, command=lambda c=col: self.sort_processes(c))
             self.process_tree.column(col, width=widths[col], minwidth=50,
-                                     stretch=(col == 'Name'),
-                                     anchor='w' if col in ('Name', 'Status') else 'center')
+                                     stretch=False,
+                                     anchor='w' if col == 'Status' else 'center')
 
         vscroll.config(command=self.process_tree.yview)
         hscroll.config(command=self.process_tree.xview)
@@ -1077,7 +1103,8 @@ class ByteDogApp:
     def sort_processes(self, column):
         """Sort process list by column"""
         col_map = {'PID': 'pid', 'Name': 'name', 'CPU %': 'cpu_percent',
-                   'Memory %': 'memory_percent', 'GPU MB': 'gpu_mb', 'Status': 'status'}
+                   'Memory %': 'memory_percent', 'Disk I/O': 'disk_io_mb',
+                   'GPU MB': 'gpu_mb', 'Status': 'status'}
 
         if column in col_map:
             if self.sort_column == col_map[column]:
@@ -1133,7 +1160,7 @@ class ByteDogApp:
         item = self.process_tree.identify('item', event.x, event.y)
         if item:
             self.process_tree.selection_set(item)
-            name = self.process_tree.item(item)['values'][1]
+            name = self.process_tree.item(item)['text']
             lock = '🔒 ' if self._is_protected(name) else ''
 
             menu = tk.Menu(self.root, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
@@ -1205,7 +1232,7 @@ class ByteDogApp:
         if not selection:
             return
         item = self.process_tree.item(selection[0])
-        pid, name = item['values'][0], item['values'][1]
+        pid, name = item['values'][0], item['text']
 
         if self._is_protected(name):
             if not self._show_protected_override_dialog(name, pid, 'kill'):
@@ -1228,7 +1255,7 @@ class ByteDogApp:
         if not selection:
             return
         item = self.process_tree.item(selection[0])
-        pid, name = item['values'][0], item['values'][1]
+        pid, name = item['values'][0], item['text']
 
         if self._is_protected(name) and not self._show_protected_override_dialog(name, pid, 'suspend'):
             return
@@ -1280,8 +1307,28 @@ class ByteDogApp:
                 except:
                     messagebox.showerror("Error", "Could not retrieve process details")
 
+    def _insert_process_row(self, proc, parent):
+        """Insert one process as a Treeview row under `parent` ('' = top
+        level). Name goes to the special '#0' tree column (text=), not
+        `values` — see create_process_list. Returns the new item iid."""
+        tags = ('protected',) if self._is_protected(proc['name']) else ()
+        return self.process_tree.insert(parent, 'end', text=proc['name'][:30], values=(
+            proc['pid'],
+            f"{proc.get('cpu_percent', 0):.1f}",
+            f"{proc.get('memory_percent', 0):.1f}",
+            f"{proc.get('disk_io_mb', 0):.1f}",
+            f"{proc.get('gpu_mb', 0):.0f}",
+            proc['status']
+        ), tags=tags)
+
     def update_process_list(self):
-        """Update the process list display"""
+        """Update the process list display.
+
+        Search vs. grouping: while a search term is active, the tree-building
+        step is skipped entirely and matches are inserted flat/top-level —
+        otherwise a match nested inside a filtered-out/collapsed parent would
+        be invisible. Hierarchy grouping only applies with no active filter.
+        """
         if not hasattr(self, 'process_tree'):
             return
 
@@ -1297,20 +1344,56 @@ class ByteDogApp:
         if search_term:
             processes = [p for p in processes if search_term in p['name'].lower()]
 
-        # Sort processes
+        # Sort processes. This also drives child-ordering within a parent
+        # once the tree is built below (a reasonable simplification versus a
+        # fully correct hierarchical sort — top-level rows and each parent's
+        # children independently follow the sort key, but a parent's rank
+        # isn't computed from its children's values).
         processes.sort(key=lambda x: x.get(self.sort_column, 0) or 0, reverse=self.sort_reverse)
 
-        # Add to tree (limit to top 100 for performance)
-        for proc in processes[:100]:
-            tags = ('protected',) if self._is_protected(proc['name']) else ()
-            self.process_tree.insert('', 'end', values=(
-                proc['pid'],
-                proc['name'][:30],
-                f"{proc.get('cpu_percent', 0):.1f}",
-                f"{proc.get('memory_percent', 0):.1f}",
-                f"{proc.get('gpu_mb', 0):.0f}",
-                proc['status']
-            ), tags=tags)
+        # Cap for performance BEFORE tree-building, on the flat sorted list
+        # (top 100 overall) — not per-branch, so grouping can't inflate the
+        # effective row count.
+        processes = processes[:100]
+
+        if search_term:
+            # Flat: insert every match as a top-level row.
+            for proc in processes:
+                self._insert_process_row(proc, '')
+            return
+
+        # No filter: group children under their parent via ppid.
+        pid_set = {p['pid'] for p in processes}
+        item_map = {}  # pid -> item iid, filled as rows are placed
+
+        top_level = [p for p in processes if p.get('ppid') not in pid_set]
+        remaining = [p for p in processes if p.get('ppid') in pid_set]
+
+        for proc in top_level:
+            item_map[proc['pid']] = self._insert_process_row(proc, '')
+
+        # Repeatedly place processes whose parent has now been inserted,
+        # until nothing more can be placed. Bounded by len(remaining) passes
+        # so a cycle (A's ppid=B, B's ppid=A) can't infinite-loop — it just
+        # falls through to the top-level fallback below.
+        while remaining:
+            placed_this_pass = []
+            still_remaining = []
+            for proc in remaining:
+                parent_iid = item_map.get(proc.get('ppid'))
+                if parent_iid is not None:
+                    item_map[proc['pid']] = self._insert_process_row(proc, parent_iid)
+                    placed_this_pass.append(proc)
+                else:
+                    still_remaining.append(proc)
+            if not placed_this_pass:
+                break
+            remaining = still_remaining
+
+        # Leftover (orphaned or cyclic parent references) — place as
+        # top-level rows rather than dropping them.
+        for proc in remaining:
+            item_map[proc['pid']] = self._insert_process_row(proc, '')
 
     def _is_protected(self, name) -> bool:
         """True if `name` is on the guardian's protected/never-touch list
