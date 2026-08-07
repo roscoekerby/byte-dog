@@ -221,3 +221,102 @@ Not done: didn't extend protection to the alert-screen's "Kill Top
 Hog"/"Suspend Top" manual buttons — they were already safe, since they only
 ever pick from `select_targets()`'s already-filtered candidate list, so a
 protected process can never appear as a "top hog" target through that path.
+
+# Feature: Task Manager parity (Services/Startup/Users tabs, process tree,
+# graceful kill) via 5 parallel subagents
+
+User: "add all of those using subagents", referring to the gaps named in
+the earlier Task-Manager-comparison answer. Scoped down two items before
+dispatching: dropped "App History" entirely (no reliable Windows API
+without diagnostic telemetry — would just be fake data) and per-process
+network I/O (Windows only exposes that via ETW tracing, too heavy) in
+favor of per-process Disk I/O, which is straightforward via
+`psutil.Process.io_counters()`.
+
+## Plan
+- [x] Scaffolded the shared, conflict-prone wiring myself first (three new
+      `notebook.add(...)` calls + matching stub tab methods in
+      `create_detailed_view`), compiled/tested/committed that as a stable
+      base — so no two parallel agents would independently edit the same
+      shared method and collide at merge time.
+- [x] 5 parallel subagents, each in an isolated `git worktree`:
+      1. Graceful WM_CLOSE-before-hard-kill on manual kills only (Guardian's
+         automatic emergency kill stays instant — `graceful=False` at the
+         `_auto_act` call site)
+      2. Process tree grouping by ppid (`show='tree headings'`, Name moved
+         to the `'#0'` column) + a new Disk I/O column
+      3. Services tab: list/sort/search + Start/Stop via `sc.exe`
+         (confirmation-gated, background thread, `CREATE_NO_WINDOW`)
+      4. Startup tab: Run keys + Startup folder, enable/disable via the
+         same `StartupApproved` registry flag real Task Manager uses
+         (non-destructive — never touches the actual Run value)
+      5. Users tab: read-only `psutil.users()` listing, no logoff action
+- [x] All 5 branches merged into `main` with `--no-ff` — **zero textual
+      conflicts**, confirming the pre-scaffolding approach worked as
+      intended
+- [x] Post-merge semantic review (not just "did git merge cleanly"):
+      AST-level duplicate-method-name check across every class (would
+      silently shadow, not error), confirmed the process-tree agent
+      correctly propagated its `item['values'][1]` -> `item['text']`
+      Treeview change into the protected-process override dialog code
+      from an earlier session (not something it was explicitly told about
+      — it read the surrounding code and updated it correctly), verified
+      the three separate `kill_process()` call sites (manual: default
+      `graceful=True`; alert-screen "Kill Top Hog": default; Guardian
+      auto-escalation: explicit `graceful=False`) are each correct
+- [x] **Real bug caught by live smoke-testing, not by pytest/compile**:
+      the Services tab starts its background scan thread during
+      `ByteDogApp.__init__` (tabs are built eagerly at startup), before
+      `run()` calls `root.mainloop()`. If the scan finished fast enough to
+      hit `root.after(0, ...)` from its thread before the mainloop was
+      actually pumping, Tkinter raised `RuntimeError: main thread is not
+      in main loop` — reproduced live (not every run — timing-dependent
+      race), fixed by deferring the scan's *start* via
+      `self.root.after(1500, self.refresh_services)` instead of calling it
+      directly at tab-build time, matching the existing codebase
+      convention (`root.after(2000, self.update_guardian_tab)`) for
+      exactly this kind of "defer until mainloop is running" need
+- [x] **Second real bug, found independently while reviewing the Services
+      agent's own report**: it hit `ttk.Label.config(fg=...)` ->
+      `TclError: unknown option "-fg"` in its own new code (fixed there),
+      and flagged that `self.status_label` (a `ttk.Label`) had the exact
+      same bug pre-existing in 8 other call sites across the app —
+      including Kill/Suspend/Resume/Refresh, the core interactive actions
+      this whole session has been building on. Confirmed live in isolation
+      first, then grepped/fixed all 8 (`fg=` -> `foreground=`), and
+      separately confirmed every OTHER `fg=` site in the file targets a
+      classic `tk.Label`/`tk.Button` (safe) via construction-site grep, so
+      nothing else needed touching
+- [x] `python -m py_compile` + `pytest -q` (40/40) + three separate live
+      smoke tests (6s / 8s / 20s background launches) after the merge and
+      after each of the two bug fixes above
+- [x] Cleaned up all 5 worktrees and merged branches after confirming the
+      merge
+
+## Review
+
+**What changed and why:** five genuinely independent features landed via
+parallel subagents with zero merge conflicts, because the shared insertion
+point (registering a new tab) was done once, upfront, by the orchestrator
+rather than delegated. The two real bugs found post-merge (`ttk` `fg=`
+crash, Services-tab startup race) are the clearest evidence for why "tests
+pass + it compiles" isn't sufficient sign-off for Tkinter UI work — both
+were only reachable by actually launching the app and either exercising a
+button (fg=) or hitting an unlucky timing window (the race). Neither would
+ever show up in `pytest` (which only covers `guardian.py`'s pure logic) or
+`py_compile`.
+
+Not done / explicitly scoped out: App History tab (no reliable API, would
+be fake data) and per-process network I/O (needs ETW, too heavy) — told to
+the user before dispatching, not silently dropped.
+
+Known residual risk: the Services/Startup tabs' destructive-ish actions
+(service Start/Stop, startup item enable/disable) were deliberately NOT
+live-tested against real services/registry entries by their respective
+subagents (per explicit instruction — too risky to have an agent
+autonomously stop a real Windows service or toggle a real startup entry
+during its own verification pass). Their correctness rests on code review
++ the documented Win32/registry mechanisms, not an end-to-end live test.
+Worth the user trying Start/Stop on a low-stakes service (e.g. Print
+Spooler) and a startup-item toggle themselves before trusting it on
+anything that matters.

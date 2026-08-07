@@ -1148,11 +1148,11 @@ class ByteDogApp:
     def refresh_processes(self):
         """Trigger async process memory scan then refresh the list."""
         if hasattr(self, 'status_label'):
-            self.status_label.config(text="Scanning processes...", fg=self.colors['warning'])
+            self.status_label.config(text="Scanning processes...", foreground=self.colors['warning'])
         def _done(procs):
             self.update_process_list()
             if hasattr(self, 'status_label'):
-                self.status_label.config(text=f"Found {len(procs)} processes", fg=self.colors['success'])
+                self.status_label.config(text=f"Found {len(procs)} processes", foreground=self.colors['success'])
         self.trigger_process_scan(callback=_done)
 
     def _active_detailed_tab_text(self):
@@ -1266,9 +1266,9 @@ class ByteDogApp:
             return
 
         if self.process_manager.kill_process(pid):
-            self.status_label.config(text=f"Killed process {pid}", fg=self.colors['success'])
+            self.status_label.config(text=f"Killed process {pid}", foreground=self.colors['success'])
         else:
-            self.status_label.config(text=f"Failed to kill process {pid}", fg=self.colors['error'])
+            self.status_label.config(text=f"Failed to kill process {pid}", foreground=self.colors['error'])
         self.refresh_processes()
 
     def suspend_selected_process(self):
@@ -1286,9 +1286,9 @@ class ByteDogApp:
             return
 
         if self.process_manager.suspend_process(pid):
-            self.status_label.config(text=f"Suspended process {pid}", fg=self.colors['success'])
+            self.status_label.config(text=f"Suspended process {pid}", foreground=self.colors['success'])
         else:
-            self.status_label.config(text=f"Failed to suspend process {pid}", fg=self.colors['error'])
+            self.status_label.config(text=f"Failed to suspend process {pid}", foreground=self.colors['error'])
         self.refresh_processes()
 
     def resume_selected_process(self):
@@ -1300,9 +1300,9 @@ class ByteDogApp:
                 pid = item['values'][0]
 
                 if self.process_manager.resume_process(pid):
-                    self.status_label.config(text=f"Resumed process {pid}", fg=self.colors['success'])
+                    self.status_label.config(text=f"Resumed process {pid}", foreground=self.colors['success'])
                 else:
-                    self.status_label.config(text=f"Failed to resume process {pid}", fg=self.colors['error'])
+                    self.status_label.config(text=f"Failed to resume process {pid}", foreground=self.colors['error'])
                 self.refresh_processes()
 
     def show_process_details(self):
@@ -2321,7 +2321,14 @@ Created with Python and psutil
         # Populate once via a background scan (enumerating ALL services can
         # take a moment) — manual Refresh only, no auto-refresh timer, since
         # the list changing mid-confirmation on Start/Stop would be risky.
-        self.refresh_services()
+        # Deferred via root.after rather than called directly: this tab is
+        # built during ByteDogApp.__init__, before run() calls
+        # root.mainloop() — if the background scan finished fast enough to
+        # call root.after(0, ...) from its thread before the mainloop was
+        # actually pumping, Tkinter raised "RuntimeError: main thread is not
+        # in main loop". Scheduling the scan's *start* via root.after
+        # guarantees the mainloop is already running by the time it fires.
+        self.root.after(1500, self.refresh_services)
 
     def refresh_services(self):
         """Enumerate Windows services off the UI thread, then refresh the tree."""
