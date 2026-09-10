@@ -71,6 +71,16 @@ def resource_path(name: str) -> str:
     return os.path.join(os.path.dirname(__file__), name)
 
 
+def apply_window_icon(window: tk.Misc) -> None:
+    """Give a toplevel the ByteDog icon (title bar, alt-tab, taskbar button)."""
+    if platform.system() != "Windows":
+        return
+    try:
+        window.iconbitmap(resource_path("ByteDog_256.ico"))
+    except tk.TclError:
+        pass
+
+
 class SystemMonitor:
     """Core system monitoring functionality"""
 
@@ -417,13 +427,7 @@ class MinimalView(tk.Toplevel):
         self.resizable(False, False)
         self.attributes('-topmost', True)
         self.overrideredirect(True)
-
-        # Window icon for Windows
-        if platform.system() == "Windows":
-            try:
-                self.iconbitmap(resource_path("ByteDog_256.ico"))
-            except Exception:
-                pass
+        apply_window_icon(self)
 
         self.configure(bg='#1e1e1e')
 
@@ -506,13 +510,7 @@ class ByteDogApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("ByteDog - System Resource Monitor 🐕")
-
-        # Window icon for Windows
-        if platform.system() == "Windows":
-            try:
-                self.root.iconbitmap(resource_path("ByteDog_256.ico"))
-            except Exception:
-                pass
+        apply_window_icon(self.root)
 
         self.monitor = SystemMonitor()
         self.process_manager = ProcessManager()
@@ -1216,6 +1214,7 @@ class ByteDogApp:
 
         dialog = tk.Toplevel(self.root)
         dialog.title(f"Protected Process — {name}")
+        apply_window_icon(dialog)
         dialog.configure(bg=self.colors['bg'])
         dialog.transient(self.root)
         dialog.resizable(False, False)
@@ -1842,13 +1841,7 @@ class ByteDogApp:
         report_window.title("Performance Report")
         report_window.geometry("600x500")
         report_window.configure(bg=self.colors['bg'])
-
-        # Window icon for Windows
-        if platform.system() == "Windows":
-            try:
-                report_window.iconbitmap(resource_path("ByteDog_256.ico"))
-            except Exception:
-                pass
+        apply_window_icon(report_window)
 
         text = tk.Text(report_window, bg=self.colors['button'], fg=self.colors['fg'],
                        font=('Consolas', 10))
@@ -1884,13 +1877,7 @@ class ByteDogApp:
         settings_window.title("Settings")
         settings_window.geometry("400x300")
         settings_window.configure(bg=self.colors['bg'])
-
-        # Window icon for Windows
-        if platform.system() == "Windows":
-            try:
-                settings_window.iconbitmap(resource_path("ByteDog_256.ico"))
-            except Exception:
-                pass
+        apply_window_icon(settings_window)
 
         # Update interval
         tk.Label(settings_window, text="Update Interval (seconds):", bg=self.colors['bg'],
@@ -2051,6 +2038,7 @@ Created with Python and psutil
         alert = tk.Toplevel(self.root)
         alert.tier = tier
         alert.title("ByteDog Guardian")
+        apply_window_icon(alert)
         alert.attributes('-topmost', True)
         alert.configure(bg='#1a1a1a')
         alert.resizable(False, False)
@@ -2958,6 +2946,14 @@ Created with Python and psutil
 
         # Handle window closing
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        # Re-announce the icon once the event loop is running. Explorer asks a
+        # window for its icon (WM_GETICON) the moment it is first shown, and Tk
+        # only answers from inside mainloop(); the window is mapped in
+        # setup_window() and the main thread then blocks on the startup
+        # process scan above, so that first query times out and the taskbar
+        # falls back to Tk's class icon (the feather) for good. A fresh
+        # WM_SETICON makes Explorer ask again while we can answer.
+        self.root.after(0, apply_window_icon, self.root)
         self.root.mainloop()
 
     def schedule_metric_updates(self):
