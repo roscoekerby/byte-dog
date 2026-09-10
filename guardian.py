@@ -706,14 +706,30 @@ def uninstall_autostart() -> tuple:
         return False, f'registry write failed: {e}'
 
 
-def autostart_installed() -> bool:
+def _stored_autostart_command() -> str | None:
     if sys.platform != 'win32':
-        return False
+        return None
     import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY_PATH,
                              0, winreg.KEY_READ) as key:
-            winreg.QueryValueEx(key, AUTOSTART_APP_NAME)
-        return True
+            return winreg.QueryValueEx(key, AUTOSTART_APP_NAME)[0]
     except OSError:
-        return False
+        return None
+
+
+def autostart_installed() -> bool:
+    return _stored_autostart_command() is not None
+
+
+def refresh_autostart() -> tuple:
+    """Point an existing auto-start entry at the current launcher (e.g. after
+    moving from `pythonw bytedog.py` to ByteDog.exe). Never installs: a user
+    who removed auto-start keeps it removed. Returns (changed, message)."""
+    stored = _stored_autostart_command()
+    if stored is None:
+        return False, 'auto-start not installed'
+    if stored == _autostart_command():
+        return False, 'auto-start already current'
+    ok, msg = install_autostart()
+    return ok, ('Auto-start updated to current launcher' if ok else msg)

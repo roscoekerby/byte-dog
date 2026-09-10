@@ -25,6 +25,7 @@ from guardian import (
     DEFAULT_PROTECTED, GuardianConfig, EscalationEngine,
     fast_memory_snapshot, enrich_chromium, select_targets, group_by_name,
     harden_self, install_autostart, uninstall_autostart, autostart_installed,
+    refresh_autostart,
     is_admin, relaunch_elevated, enable_debug_privilege, protected_reason,
     graceful_close_process, collect_window_titles,
 )
@@ -3006,6 +3007,12 @@ def main():
                     f.write(datetime.now().isoformat())
             except OSError:
                 pass
+    else:
+        # Keep an existing entry pointing at whatever launched us now (the
+        # packaged ByteDog.exe replaces the old `pythonw bytedog.py` command)
+        changed, msg = refresh_autostart()
+        if changed:
+            print(f"Auto-start: {msg}")
 
     app = ByteDogApp()
     app.run()

@@ -43,7 +43,9 @@ before that point.
   full strength without you having to fight a frozen Explorer to manually
   "Run as administrator" mid-thrash. Declining the prompt is fine — it
   keeps running non-elevated, just with reduced kill/suspend coverage
-- **Auto-start:** Tools menu installs a Task Scheduler logon task (elevated)
+- **Auto-start:** installed once on first launch as a per-user Run-key entry
+  (Tools menu can remove or reinstall it). The entry follows whatever launched
+  ByteDog last, so switching from the script to `ByteDog.exe` updates it
 
 ## Run
 
@@ -56,6 +58,24 @@ already admin); accept it for full suspend/kill coverage and auto-start
 installation. Pass `--no-elevate` to skip the prompt during development.
 Requires `psutil` (and optionally `nvidia-ml-py` for GPU monitoring on
 NVIDIA cards).
+
+## Build the EXE
+
+`run.bat` and the Run-key auto-start launch `pythonw.exe`, so the UAC prompt,
+Task Manager's Startup tab and Settings > Startup all show Python's name and
+icon. The packaged build fixes that identity:
+
+```
+build.bat
+```
+
+(or `pyinstaller ByteDog.spec`). Output: `dist\ByteDog.exe`, a single windowed
+exe with the ByteDog icon and a version resource (ROSCODE TECH / ByteDog), no
+Python install needed on the target machine. Inputs: `ByteDog.spec`,
+`version_info.txt`, `ByteDog_256.ico`. The first run of the exe rewrites an
+existing auto-start entry to point at the exe. Windows Defender may flag a fresh
+PyInstaller exe; that is the bootloader false positive, add an exclusion for
+`dist\`.
 
 ## Configuration
 

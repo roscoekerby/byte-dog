@@ -209,3 +209,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ByteDog build inputs (the generic *.spec rule above would hide them)
+!ByteDog.spec
