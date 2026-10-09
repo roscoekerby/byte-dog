@@ -282,4 +282,8 @@ class HogPanel(tk.Frame):
         menu.add_command(label="Kill", command=lambda: self._act('kill'))
         menu.add_separator()
         menu.add_command(label="AI note (Claude sessions)", command=self._summarise)
+        tools = getattr(self.app, 'tools', None)
+        target = self.selected()
+        if tools and target:
+            tools.add_menu_items(menu, target[0], target[1], self.winfo_toplevel())
         menu.post(event.x_root, event.y_root)

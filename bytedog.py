@@ -31,6 +31,7 @@ from guardian import (
 )
 from hog_source import HogSource
 from safety import ProtectionChecker
+from process_tools_ui import DetailsPane, ProcessTools
 from hog_panel import HogPanel
 
 # GPU backend: NVML via nvidia-ml-py + PDH per-process VRAM (both in-process,
@@ -525,6 +526,7 @@ class ByteDogApp:
             user_names=lambda: {n.lower() for n in self.guardian.config.user_protected},
             self_pid=os.getpid())
         self.hog_source = HogSource(safety=self.safety)
+        self.tools = ProcessTools(self)
         threading.Thread(target=self._warm_protection_cache, daemon=True,
                          name='ByteDogSafetyWarm').start()
         self.hog_panel_window = None
@@ -862,6 +864,8 @@ class ByteDogApp:
         tools_menu.add_command(label="Toggle RAM Guardian", command=self._menu_toggle_guardian)
         tools_menu.add_command(label="Resume Suspended Processes", command=self._resume_all_suspended)
         tools_menu.add_command(label="Memory Hog Panel", command=self.open_hog_panel)
+        tools_menu.add_command(label="Who Is Locking a File...",
+                               command=lambda: self.tools.who_locks_dialog())
         tools_menu.add_separator()
         tools_menu.add_command(label="Install Auto-Start (login)", command=self._menu_install_autostart)
         tools_menu.add_command(label="Remove Auto-Start", command=self._menu_uninstall_autostart)
@@ -1085,6 +1089,9 @@ class ByteDogApp:
 
         # Full process list
         self.create_process_list(parent)
+        self.details_pane = DetailsPane(parent, self)
+        self.details_pane.pack(fill='x', padx=10, pady=(4, 6))
+        self.process_tree.bind('<<TreeviewSelect>>', self._on_process_select, add='+')
 
     def create_performance_tab(self, parent):
         """Create performance graphs tab"""
@@ -1213,6 +1220,7 @@ class ByteDogApp:
             menu.add_command(label=f"{lock}Kill Process", command=self.kill_selected_process)
             menu.add_command(label=f"{lock}Suspend Process", command=self.suspend_selected_process)
             menu.add_command(label="Resume Process", command=self.resume_selected_process)
+            self.tools.add_menu_items(menu, pid, name, self.root)
             menu.add_separator()
             menu.add_command(label="Process Details", command=self.show_process_details)
 
@@ -1222,7 +1230,7 @@ class ByteDogApp:
         """Modal warning for kill/suspend on a protected process: explains
         the specific consequence and requires an explicit 'Override' click
         rather than a plain Yes/No. Returns True only if the user overrides."""
-        verb = 'Kill' if action == 'kill' else 'Suspend'
+        verb = {'kill': 'Kill', 'suspend': 'Suspend'}.get(action, action.capitalize())
         result = {'override': False}
 
         parent = parent or self.root
@@ -1498,6 +1506,19 @@ class ByteDogApp:
         # top-level rows rather than dropping them.
         for proc in remaining:
             item_map[proc['pid']] = self._insert_process_row(proc, '')
+
+    def _on_process_select(self, _event=None):
+        sel = self._selected_process()
+        if sel and hasattr(self, 'details_pane'):
+            self.details_pane.show(*sel)
+
+    def report_status(self, msg, ok=True):
+        """One place for action feedback: status bar plus the open alert."""
+        if hasattr(self, 'status_label'):
+            self.status_label.config(text=msg, foreground=self.colors['success' if ok else 'error'])
+        alert = self.guardian_alert_window
+        if alert and alert.winfo_exists():
+            self.update_alert_hogs(msg)
 
     def _warm_protection_cache(self):
         """Verify every running process once in the background (~1s for ~400

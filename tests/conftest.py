@@ -26,3 +26,13 @@ def dog():
         application.root.destroy()
     except tk.TclError:
         pass
+
+
+class InlineThread:
+    """Runs a worker on the calling (main) thread. Tests have no mainloop,
+    so a real worker thread cannot call after(); the app always has one."""
+    def __init__(self, target, **kwargs):
+        self.target = target
+
+    def start(self):
+        self.target()

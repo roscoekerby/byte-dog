@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from guardian import DEFAULT_PROTECTED
 from hog_model import build_rows
 from hog_panel import HogPanel
+from conftest import InlineThread
 
 GB = 1024 ** 3
 PROCS = [
@@ -128,16 +129,6 @@ def test_full_view_button_opens_panel(panel):
     assert len(buttons) == 1
     buttons[0].invoke()
     assert app.calls == [('open',)]
-
-
-class InlineThread:
-    """Runs the worker on the calling (main) thread: tests have no mainloop,
-    so a real worker thread cannot call after()."""
-    def __init__(self, target, **kwargs):
-        self.target = target
-
-    def start(self):
-        self.target()
 
 
 def test_failed_scan_reports_and_keeps_refreshing(dog, monkeypatch):
