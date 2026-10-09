@@ -70,7 +70,7 @@ class FakeApp:
 def panel(dog):
     app = FakeApp()
     p = HogPanel(dog.root, app, compact=True)
-    p.refresh = lambda: None          # no background threads in tests
+    p.refresh = lambda **k: None      # no background threads in tests
     rows = app.hog_source.rows(DEFAULT_PROTECTED, set(), None)
     p._loaded(rows)
     yield p, app
@@ -142,7 +142,7 @@ def test_failed_scan_reports_and_keeps_refreshing(dog, monkeypatch):
     app.hog_source.rows = boom
     p = HogPanel(dog.root, app, compact=True)
     try:
-        p.refresh()
+        p.refresh(force=True)
         for _ in range(200):
             dog.root.update()
             if 'Scan failed' in p.status.cget('text'):
@@ -169,7 +169,7 @@ def test_render_keeps_scroll_position(dog):
     app.hog_source.rows = lambda *a: build_rows(many, DEFAULT_PROTECTED)
     win = tk.Toplevel(dog.root)
     p = HogPanel(win, app)
-    p.refresh = lambda: None
+    p.refresh = lambda **k: None
     p.pack(fill='both', expand=True)
     try:
         p._loaded(app.hog_source.rows())

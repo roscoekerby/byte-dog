@@ -12,7 +12,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from safety import Facts, ProtectionChecker, decide, signer_of
+from safety import Facts, ProtectionChecker, decide
+from signing import signer_of
 
 WIN = r'C:\Windows'
 win_only = pytest.mark.skipif(sys.platform != 'win32', reason='Windows APIs')
@@ -148,3 +149,65 @@ def test_copied_svchost_running_from_temp_is_not_protected(tmp_path):
         assert not v.protected, v
     finally:
         proc.kill()
+
+
+# ── review fixes: fail safe, never cache an unknown ──────────────────────
+
+def test_unknown_signature_in_windows_dir_is_protected():
+    v = decide(F(path=r'C:\Windows\explorer.exe', signer='', signer_known=False), WIN)
+    assert v.protected and 'could not be checked' in v.reason
+
+
+def test_unknown_signature_outside_windows_is_not_protected():
+    assert not decide(F(signer='', signer_known=False), WIN).protected
+
+
+def test_missing_path_or_unknown_critical_is_protected():
+    assert decide(F(path=''), WIN).protected
+    assert decide(F(critical=None), WIN).protected
+
+
+def test_signer_must_match_microsoft_exactly():
+    path = r'C:\Windows\System32\x.exe'
+    assert decide(F(path=path, signer='Microsoft Corporation'), WIN).protected
+    assert not decide(F(path=path, signer='Microsoftish Labs LLC'), WIN).protected
+
+
+def test_second_bytedog_instance_is_protected_by_image_path():
+    exe = r'C:\Apps\ByteDog\ByteDog.exe'
+    assert decide(F(pid=999, path=exe), WIN, self_pid=1, self_exe=exe).protected
+
+
+def test_incomplete_facts_and_missing_ctime_are_not_cached():
+    calls = []
+
+    def gather(pid, name):
+        calls.append(pid)
+        return F(pid=pid, name=name, path=r'C:\Windows\explorer.exe', signer_known=False)
+    c = ProtectionChecker(gather=gather, windows_dir=WIN)
+    c.check({'pid': 5, 'name': 'explorer.exe', 'ctime': 1})
+    c.check({'pid': 5, 'name': 'explorer.exe', 'ctime': 1})
+    c.check({'pid': 6, 'name': 'a.exe', 'ctime': None})
+    c.check({'pid': 6, 'name': 'a.exe', 'ctime': None})
+    assert calls == [5, 5, 6, 6]
+
+
+@win_only
+def test_signature_failure_is_not_cached(monkeypatch):
+    import signing
+    path = r'C:\Windows\System32\winver.exe'
+    signing._cache.clear()
+
+    def boom(p, h):
+        raise signing._Unknown('crypto service busy')
+    monkeypatch.setattr(signing, '_signer_from_handle', boom)
+    assert signing.signature(path) == ('', False)
+    monkeypatch.undo()
+    assert signing.signature(path) == ('Microsoft Corporation', True)
+
+
+@win_only
+def test_check_pid_uses_live_start_time():
+    c = ProtectionChecker(self_pid=os.getpid())
+    assert c.check_pid(os.getpid(), 'python.exe').protected      # self
+    assert c.check_pid(999_999_99, 'gone.exe').protected         # gone -> unverifiable

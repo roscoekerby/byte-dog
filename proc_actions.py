@@ -92,7 +92,7 @@ def details(pid: int) -> dict | None:
             def get(fn, default=''):
                 try:
                     return fn()
-                except (psutil.AccessDenied, psutil.ZombieProcess, OSError):
+                except (psutil.Error, OSError):    # incl. a parent that has exited
                     return default
             ppid = get(p.ppid, None)
             parent = get(lambda: psutil.Process(ppid).name()) if ppid else ''
@@ -113,26 +113,52 @@ def details(pid: int) -> dict | None:
 
 # ── restart ──────────────────────────────────────────────────────────────
 
-def restart(pid: int, console: bool = True) -> int:
-    """Kill pid and relaunch the same command line in the same folder.
-    If ByteDog is elevated but the target was not, the new process is
-    created under Explorer's (non-admin) token so a restart never silently
-    upgrades an app to admin. Returns the new pid; raises psutil.Error /
-    OSError on failure."""
+@dataclass(frozen=True)
+class RestartPlan:
+    exe: str
+    cmd: str
+    cwd: str
+    shell_pid: int | None    # launch under this explorer.exe (de-elevated) when set
+
+
+def plan_restart(pid: int) -> RestartPlan:
+    """Work out exactly how to relaunch pid BEFORE anything is killed.
+    Raises psutil.Error / OSError if the relaunch could not be done safely.
+    When ByteDog is elevated and the target is not known to be elevated, the
+    relaunch must go under the user's own Explorer (non-admin token); if that
+    is impossible the restart is refused rather than silently run as admin."""
     proc = psutil.Process(pid)
-    cmdline, cwd = proc.cmdline(), proc.cwd()
-    if not cmdline:
-        raise OSError("command line unavailable (access denied)")
-    target_elevated = is_elevated(pid)
-    proc.kill()
-    proc.wait(KILL_WAIT_S)
-    cmd = subprocess.list2cmdline(cmdline)
-    flags = 0x10 if console else 0x08000000     # CREATE_NEW_CONSOLE / CREATE_NO_WINDOW
-    if sys.platform == 'win32' and is_elevated(_self_pid()) and target_elevated is False:
+    exe, cmdline, cwd = proc.exe(), proc.cmdline(), proc.cwd()
+    if not exe or not cmdline:
+        raise OSError("image path or command line unavailable (access denied)")
+    shell = None
+    if sys.platform == 'win32' and is_elevated(_self_pid()) and not is_elevated(pid):
         shell = _shell_pid()
-        if shell:
-            return _spawn_under(shell, cmd, cwd, flags)
-    return subprocess.Popen(cmd, cwd=cwd, creationflags=flags, close_fds=True).pid
+        if not shell:
+            raise OSError("no desktop shell for this user to relaunch it without admin "
+                          "rights; restart it yourself")
+    return RestartPlan(exe, subprocess.list2cmdline(cmdline), cwd, shell)
+
+
+def restart(pid: int, console: bool = True) -> int:
+    """Kill pid and relaunch the same image + command line in the same folder
+    (see plan_restart). Returns the new pid; raises psutil.Error / OSError."""
+    plan = plan_restart(pid)
+    proc = psutil.Process(pid)
+    proc.kill()
+    try:
+        proc.wait(KILL_WAIT_S)
+    except psutil.TimeoutExpired:
+        raise OSError(f"PID {pid} did not exit within {KILL_WAIT_S}s; not relaunched")
+    flags = 0x10 if console else 0x08000000     # CREATE_NEW_CONSOLE / CREATE_NO_WINDOW
+    try:
+        if plan.shell_pid:
+            return _spawn_under(plan.shell_pid, plan.exe, plan.cmd, plan.cwd, flags)
+        return subprocess.Popen(plan.cmd, executable=plan.exe, cwd=plan.cwd,
+                                creationflags=flags, close_fds=True).pid
+    except OSError as e:
+        raise OSError(f"the old process was closed but relaunching failed: {e}. "
+                      f"Command was: {plan.cmd}") from e
 
 
 def _self_pid() -> int:
@@ -185,7 +211,7 @@ def is_elevated(pid: int) -> bool | None:
         k32.CloseHandle(h)
 
 
-def _spawn_under(parent_pid: int, cmd: str, cwd: str, flags: int) -> int:
+def _spawn_under(parent_pid: int, exe: str, cmd: str, cwd: str, flags: int) -> int:
     """CreateProcess with PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: the child
     inherits the parent's token (de-elevation from an admin ByteDog)."""
     from ctypes import wintypes as w
@@ -230,9 +256,10 @@ def _spawn_under(parent_pid: int, cmd: str, cwd: str, flags: int) -> int:
     size = ctypes.c_size_t(0)
     k32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
     attrs = ctypes.create_string_buffer(size.value)
+    if not k32.InitializeProcThreadAttributeList(attrs, 1, 0, ctypes.byref(size)):
+        k32.CloseHandle(hparent)
+        raise OSError(ctypes.get_last_error(), "InitializeProcThreadAttributeList")
     try:
-        if not k32.InitializeProcThreadAttributeList(attrs, 1, 0, ctypes.byref(size)):
-            raise OSError(ctypes.get_last_error(), "InitializeProcThreadAttributeList")
         hp = w.HANDLE(hparent)
         if not k32.UpdateProcThreadAttribute(attrs, 0, 0x00020000,   # PARENT_PROCESS
                                              ctypes.byref(hp), ctypes.sizeof(hp), None, None):
@@ -243,7 +270,7 @@ def _spawn_under(parent_pid: int, cmd: str, cwd: str, flags: int) -> int:
         pi = PROCESS_INFORMATION()
         buf = ctypes.create_unicode_buffer(cmd)
         extended = 0x00080000                                         # EXTENDED_STARTUPINFO_PRESENT
-        if not k32.CreateProcessW(None, buf, None, None, False, flags | extended, None,
+        if not k32.CreateProcessW(exe, buf, None, None, False, flags | extended, None,
                                   cwd or None, ctypes.byref(si), ctypes.byref(pi)):
             raise OSError(ctypes.get_last_error(), "CreateProcessW")
         k32.CloseHandle(pi.hThread)

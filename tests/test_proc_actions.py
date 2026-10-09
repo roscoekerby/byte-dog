@@ -140,7 +140,7 @@ def test_spawn_under_shell_inherits_the_shell_as_parent(tmp_path):
     shell = _shell_pid()
     assert shell, "no explorer.exe in this session"
     cmd = subprocess.list2cmdline([sys.executable, '-c', 'import time; time.sleep(30)'])
-    pid = _spawn_under(shell, cmd, str(tmp_path), 0x08000000)
+    pid = _spawn_under(shell, sys.executable, cmd, str(tmp_path), 0x08000000)
     try:
         child = psutil.Process(pid)
         assert child.ppid() == shell
@@ -148,3 +148,45 @@ def test_spawn_under_shell_inherits_the_shell_as_parent(tmp_path):
         assert is_elevated(pid) == is_elevated(shell)
     finally:
         psutil.Process(pid).kill()
+
+
+def test_details_survives_an_exited_parent():
+    """Regression: explorer.exe's parent is long gone; looking up the parent's
+    name raised NoSuchProcess and details() reported the process itself as exited."""
+    code = ("import subprocess, sys, time\n"
+            "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+            "                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,\n"
+            "                     stderr=subprocess.DEVNULL)\n"
+            "print(p.pid, flush=True)")
+    out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
+                         creationflags=NO_WINDOW)
+    orphan = int(out.stdout.strip())
+    try:
+        d = details(orphan)
+        assert d is not None and d['pid'] == orphan
+        assert d['parent_name'] == ''
+    finally:
+        psutil.Process(orphan).kill()
+
+
+def test_restart_refuses_before_killing_when_it_cannot_de_elevate(monkeypatch):
+    """An elevated ByteDog with no user shell must not relaunch a normal app
+    as admin, and must not have killed it either."""
+    import proc_actions
+    proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],
+                            creationflags=NO_WINDOW)
+    try:
+        monkeypatch.setattr(proc_actions, 'is_elevated',
+                            lambda pid: pid == proc_actions._self_pid())
+        monkeypatch.setattr(proc_actions, '_shell_pid', lambda: None)
+        with pytest.raises(OSError, match='without admin'):
+            restart(proc.pid, console=False)
+        assert psutil.pid_exists(proc.pid) and proc.poll() is None
+    finally:
+        proc.kill()
+
+
+def test_plan_uses_exact_image_path():
+    from proc_actions import plan_restart
+    plan = plan_restart(os.getpid())
+    assert Path(plan.exe) == Path(psutil.Process().exe())

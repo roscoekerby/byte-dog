@@ -537,3 +537,90 @@ Accepted: first scan reads every Chromium cmdline once (cached after).
 
 **Tests:** 101 pass, 6/6 repeated runs. One Tcl interpreter per session (conftest `dog`):
 a second `Tk()` per run flaked on init.tcl and could not be retried.
+
+# 2026-10-10: Task Manager, but better (Process Explorer powers, verified safeguards, docked Guardian)
+
+## Findings
+- The "deep task manager" is Sysinternals Process Explorer (ran from Downloads, folders since
+  deleted; only `C:\Tools\Sysinternals\handle64.exe` remains). It is GUI-only with no API, so
+  it cannot be a backend. The only external control is `procexp64.exe /s:<PID>` (open with
+  that process selected). PsSuspend/PsKill make the same Win32 calls ByteDog already makes.
+  Sysinternals licence forbids bundling, so ByteDog locates it or downloads it from Microsoft.
+- Guardian already runs inside ByteDog and starts enabled; it only looks separate (popup).
+
+## Decisions (confirmed 2026-10-10)
+- Native Process Explorer powers + "Open in Process Explorer" jump-out.
+- Guardian docked into the main window; popup shrinks to a toast that opens it.
+- Protection verified by Windows, not by name; override dialog kept.
+
+## Phase 1: verified safeguards (new `safety.py`, tests first)
+- [x] `is_critical(pid)`: NtQueryInformationProcess(ProcessBreakOnTermination). Windows
+      blue-screens if these die, so they are always protected
+- [x] `image_path(pid)` + `is_ms_system_binary(path)`: under %SystemRoot% AND Authenticode
+      signed by Microsoft (WinVerifyTrust, embedded + catalog signatures), cached per
+      (path, mtime). A fake `svchost.exe` in Temp is NOT protected; the real one is
+- [x] Kernel pseudo-processes with no image (System, Registry, Memory Compression, Secure
+      System, Idle) protected by PID/kind; ByteDog itself; user "never touch" list kept
+- [x] One `protection(pid, name)` -> (protected, reason) used by the panel, the Processes
+      tab, the override dialog text and the Guardian's auto-targeting
+- [x] Unknown (access denied, unsigned check failed) on a System32 path = protected (fail safe)
+
+## Phase 2: Process Explorer powers, native (new `proc_actions.py` + details pane)
+- [x] Kill process tree (children first, same safeguards per child)
+- [x] Restart process (same exe, args, working dir; refused for protected)
+- [x] Set priority, set CPU affinity
+- [x] Open file location, copy command line / path
+- [x] Details pane under the Processes list: path, command line, parent, user, started,
+      verified signer, protection reason; replaces the details popup
+- [x] Open files / DLLs of a process (psutil), and "Who is locking this file?" via the
+      Windows Restart Manager. CHANGED from handle64.exe: it found nothing when not run as
+      admin (verified), while Restart Manager works without admin and needs no download
+
+## Phase 3: Process Explorer jump-out (new `sysinternals.py`)
+- [x] Locate procexp64.exe: PATH, C:\Tools\Sysinternals,
+      %LOCALAPPDATA%\ByteDog\sysinternals
+- [x] If missing, offer a one-click download from download.sysinternals.com, then verify
+      the Microsoft signature before ever running it (refuse otherwise)
+- [x] "Open in Process Explorer" on every process row (hog panel + Processes tab)
+
+## Phase 4: Guardian docked in the main window
+- [x] Guardian tab hosts the full hog panel, thresholds and event log in ByteDog's style
+- [x] Popup becomes a small toast: RAM %, action taken, [Open ByteDog] [Resume All]
+      [Dismiss]; Open jumps to the main window's Guardian tab (detailed view)
+- [x] "Full view" / Tools menu / tray paths all land on that tab; separate hog window removed
+
+## Verification
+- [x] Unit tests per module (signature + critical checks against real System32 binaries and a
+      copied fake svchost.exe in a temp dir)
+- [x] Live: tree-kill and restart a throwaway process tree; real svchost/csrss refused
+      without override; fake svchost not protected; Process Explorer opens on the right
+      PID; handle search finds a file this test locked; toast -> Guardian tab
+
+## Review (task manager phases 1-4)
+
+**Built:** verified protection (`safety.py`, `signing.py`), Process Explorer-style tools
+(`proc_actions.py`, `file_locks.py`, `process_tools_ui.py`), Process Explorer jump-out
+(`sysinternals.py`), Guardian docked in the main window (`guardian_toast.py`; hog panel in the
+Guardian tab). Deviation: Restart Manager + psutil instead of handle64.exe (handle64 saw
+nothing without admin).
+
+**Code review fixes (python-reviewer):** signature failures under memory pressure were cached
+as "unsigned", which could have unprotected explorer.exe exactly during a thrash; now only
+definitive answers are cached and an unverifiable Windows-folder binary is protected.
+Signatures are only checked for Windows-folder binaries (first pass 0.89s -> 0.23s).
+Process Explorer launch: no location is trusted (WindowsApps alias exemption removed), the
+exe must be exactly Microsoft-signed AND name Process Explorer in its version info, and it is
+verified on a handle that denies write/rename/delete until the process has started (proven:
+write, rename and delete all blocked). PID reuse: verdicts keyed on live start time (ms,
+snapshot and psutil agree). Fail-safe on missing image path / unknown critical flag. Restart
+validates before killing, launches the exact image, refuses rather than relaunching as admin.
+Kill tree / restart / open files moved off the UI thread; download worker reports any error;
+duplicate svchost rows in who-locks; attribute list freed only after init; toast RAM bar drew
+0 px; second ByteDog.exe instance protected by image path; truncated names broke the PID check.
+Kept as designed: no name-list union (user chose verified-not-by-name; the failure mode it
+guarded is now closed directly).
+
+**Also found by tests:** switching view mode crashed while any popup was open (pack_forget on
+a Toplevel); details() reported explorer.exe as exited because its parent is gone.
+
+**Tests:** 166 pass.

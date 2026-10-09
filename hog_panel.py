@@ -78,7 +78,7 @@ class HogPanel(tk.Frame):
                   command=self.app.open_hog_panel if self.compact else self._toggle_max
                   ).pack(side='right')
         tk.Button(bar, text="Refresh", bg=BTN, fg='white', relief='flat', font=('Arial', 8),
-                  command=self.refresh).pack(side='right', padx=(0, 4))
+                  command=lambda: self.refresh(force=True)).pack(side='right', padx=(0, 4))
         self._button(bar, "Suspend", lambda: self._act('suspend'))
         self._button(bar, "Resume", lambda: self._act('resume'))
         self._button(bar, "Kill", lambda: self._act('kill'), '#5a1a1a')
@@ -126,8 +126,13 @@ class HogPanel(tk.Frame):
             self.after_cancel(self._timer)
         self._timer = self.after(delay, self.refresh) if self.winfo_exists() else None
 
-    def refresh(self):
+    def refresh(self, force: bool = False):
+        """Rescan. Unforced refreshes (the 5s timer) skip the scan while the
+        panel is not on screen, e.g. the Guardian tab is not selected."""
         if not self.winfo_exists():
+            return
+        if not force and not self.winfo_viewable():
+            self._schedule()
             return
         if self._busy:
             self._pending = True
@@ -232,7 +237,7 @@ class HogPanel(tk.Frame):
                              else f"Could not {action} {name} (PID {pid}): access denied or gone.",
                              '#4caf50' if ok else '#f44336')
         self.set_status(*self._last_action)
-        self.refresh()
+        self.refresh(force=True)
 
     def _summarise(self):
         self._mark_in_use()
@@ -269,7 +274,7 @@ class HogPanel(tk.Frame):
                              else (f"AI note for PID {pid}: {note}", '#4caf50'))
         self.set_status(*self._last_action)
         if not err:
-            self.refresh()
+            self.refresh(force=True)
 
     def _context_menu(self, event):
         iid = self.tree.identify_row(event.y)

@@ -372,11 +372,18 @@ def _snapshot_ntquery():
                     if img.Buffer and img.Length else '?')
             procs.append({'pid': int(pid), 'name': name,
                           'rss': int(info.WorkingSetSize),
-                          'ctime': int(info.CreateTime)})
+                          'ctime': _filetime_to_ms(info.CreateTime)})
         if info.NextEntryOffset == 0:
             break
         offset += info.NextEntryOffset
     return procs
+
+
+def _filetime_to_ms(filetime: int) -> int:
+    """FILETIME (100ns since 1601) -> ms since the Unix epoch, the same value
+    as round(psutil.Process.create_time() * 1000), so either source can key
+    per-process caches (PID + start time identifies a process)."""
+    return round((int(filetime) - 116444736000000000) / 10000)
 
 
 def fast_memory_snapshot():
@@ -395,7 +402,7 @@ def fast_memory_snapshot():
             procs.append({'pid': proc.info['pid'],
                           'name': proc.info.get('name') or '?',
                           'rss': mi.rss if mi else 0,
-                          'ctime': proc.info.get('create_time')})
+                          'ctime': round((proc.info.get('create_time') or 0) * 1000)})
         except Exception:
             continue
     return procs

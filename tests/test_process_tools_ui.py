@@ -10,6 +10,7 @@ import psutil
 import pytest
 
 import process_tools_ui as ui
+from conftest import InlineThread
 
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -41,6 +42,7 @@ def _pump(dog, cond, timeout=5.0):
 
 def test_kill_tree_through_ui(dog, monkeypatch):
     monkeypatch.setattr(ui.messagebox, 'askyesno', lambda *a, **k: True)
+    monkeypatch.setattr('process_tools_ui.threading.Thread', InlineThread)
     root, kids = _spawn_tree()
     name = psutil.Process(root.pid).name()
     dog.tools.kill_tree(root.pid, name, dog.root)
@@ -93,7 +95,6 @@ def test_copy_command_line(dog):
 
 
 def test_details_pane_shows_process_and_protection(dog, monkeypatch):
-    from conftest import InlineThread
     monkeypatch.setattr('process_tools_ui.threading.Thread', InlineThread)
     pane = ui.DetailsPane(dog.root, dog)
     try:
@@ -103,3 +104,34 @@ def test_details_pane_shows_process_and_protection(dog, monkeypatch):
         assert pane.values['protection'].cget('text') == 'ByteDog itself'
     finally:
         pane.destroy()
+
+
+def test_who_locks_merges_services_sharing_a_pid(dog, monkeypatch, tmp_path):
+    """Regression: several services in one svchost share a PID; inserting one
+    tree row per service raised 'Item already exists'."""
+    from file_locks import Holder
+    monkeypatch.setattr(ui.filedialog, 'askopenfilenames', lambda **k: (str(tmp_path / 'f'),))
+    monkeypatch.setattr(ui, 'who_locks', lambda paths: [Holder(900, 'svchost.exe', 'Svc A'),
+                                                         Holder(900, 'svchost.exe', 'Svc B')])
+    dog.tools.who_locks_dialog(dog.root)
+    win = [w for w in dog.root.winfo_children() if isinstance(w, tk.Toplevel)
+           and w.title() == 'Who is locking this file?'][-1]
+    tree = next(w for w in win.winfo_children() if w.winfo_class() == 'Treeview')
+    assert tree.get_children() == ('900',)
+    assert tree.set('900', 'app') == 'Svc A, Svc B'
+    win.destroy()
+
+
+def test_download_failure_of_any_kind_is_reported(dog, monkeypatch):
+    monkeypatch.setattr('process_tools_ui.threading.Thread', InlineThread)
+    monkeypatch.setattr(ui.sysinternals, 'find_procexp', lambda: None)
+    monkeypatch.setattr(ui.messagebox, 'askyesno', lambda *a, **k: True)
+
+    def incomplete():
+        raise EOFError('IncompleteRead')     # not an OSError / ToolError
+    monkeypatch.setattr(ui.sysinternals, 'download_procexp', incomplete)
+    dog.tools.open_in_procexp(4, dog.root)
+    end = time.monotonic() + 3
+    while 'failed' not in dog.status_label.cget('text') and time.monotonic() < end:
+        dog.root.update()
+    assert 'Process Explorer download failed: IncompleteRead' in dog.status_label.cget('text')

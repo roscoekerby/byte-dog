@@ -9,6 +9,7 @@ Results are cached per (path, mtime, size).
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import os
 import sys
@@ -29,6 +30,7 @@ WTD_CACHE_ONLY_URL_RETRIEVAL = 0x1000
 CERT_NAME_ATTR_TYPE = 3
 OID_ORGANIZATION = b'2.5.4.10'
 GENERIC_READ = 0x80000000
+FILE_SHARE_READ = 0x1
 FILE_SHARE_ALL = 0x1 | 0x2 | 0x4
 OPEN_EXISTING = 3
 INVALID_HANDLE = ctypes.c_void_p(-1).value
@@ -123,8 +125,25 @@ def _api():
     return _dlls
 
 
+# WinVerifyTrust answers that genuinely mean "not signed (this way)". Anything
+# else (I/O error, crypto service hiccup under memory pressure) is NOT an
+# answer and must never be cached: a cached '' would strip protection from a
+# real Windows process for the rest of the session.
+UNSIGNED_STATUSES = frozenset({
+    0x800B0100,   # TRUST_E_NOSIGNATURE
+    0x800B0003,   # TRUST_E_SUBJECT_FORM_UNKNOWN
+    0x800B0001,   # TRUST_E_PROVIDER_UNKNOWN
+    0x80096010,   # TRUST_E_BAD_DIGEST (tampered: definitively not trusted)
+})
+
+
+class _Unknown(Exception):
+    """Verification could not complete; the result is not an answer."""
+
+
 def _verify(union_choice: int, info) -> str:
-    """WinVerifyTrust; on success return the leaf signer's organisation."""
+    """WinVerifyTrust. Returns the leaf signer's organisation, '' when the
+    file is definitively unsigned this way, raises _Unknown otherwise."""
     api = _api()
     data = WINTRUST_DATA(cbStruct=ctypes.sizeof(WINTRUST_DATA), dwUIChoice=WTD_UI_NONE,
                          fdwRevocationChecks=WTD_REVOKE_NONE, dwUnionChoice=union_choice,
@@ -133,91 +152,136 @@ def _verify(union_choice: int, info) -> str:
                          dwProvFlags=WTD_REVOCATION_CHECK_NONE | WTD_CACHE_ONLY_URL_RETRIEVAL)
     guid = GUID.from_buffer_copy(GENERIC_VERIFY_V2)
     try:
-        if api['wt'].WinVerifyTrust(None, ctypes.byref(guid), ctypes.byref(data)) != 0:
+        status = api['wt'].WinVerifyTrust(None, ctypes.byref(guid), ctypes.byref(data))             & 0xFFFFFFFF
+        if status in UNSIGNED_STATUSES:
             return ''
+        if status != 0:
+            raise _Unknown(f"WinVerifyTrust 0x{status:08X}")
         prov = api['wt'].WTHelperProvDataFromStateData(data.hWVTStateData)
-        if not prov:
-            return ''
-        sgnr = api['wt'].WTHelperGetProvSignerFromChain(prov, 0, False, 0)
+        sgnr = api['wt'].WTHelperGetProvSignerFromChain(prov, 0, False, 0) if prov else None
         if not sgnr or not sgnr.contents.csCertChain:
-            return ''
-        cert = sgnr.contents.pasCertChain[0].pCert
+            raise _Unknown("trusted but no signer chain")
         buf = ctypes.create_unicode_buffer(256)
-        api['c32'].CertGetNameStringW(cert, CERT_NAME_ATTR_TYPE, 0,
-                                      ctypes.c_char_p(OID_ORGANIZATION), buf, 256)
+        api['c32'].CertGetNameStringW(sgnr.contents.pasCertChain[0].pCert, CERT_NAME_ATTR_TYPE,
+                                      0, ctypes.c_char_p(OID_ORGANIZATION), buf, 256)
+        if not buf.value:
+            raise _Unknown("signer has no organisation")
         return buf.value
     finally:
         data.dwStateAction = WTD_STATEACTION_CLOSE
         api['wt'].WinVerifyTrust(None, ctypes.byref(guid), ctypes.byref(data))
 
 
-def _embedded_signer(path: str) -> str:
-    info = WINTRUST_FILE_INFO(cbStruct=ctypes.sizeof(WINTRUST_FILE_INFO), pcwszFilePath=path)
-    return _verify(WTD_CHOICE_FILE, info)
-
-
-def _catalog_signer(path: str) -> str:
-    api = _api()
-    wt, k32 = api['wt'], api['k32']
-    hfile = k32.CreateFileW(path, GENERIC_READ, FILE_SHARE_ALL, None, OPEN_EXISTING, 0, None)
+def _open(path: str, share: int):
+    hfile = _api()['k32'].CreateFileW(path, GENERIC_READ, share, None, OPEN_EXISTING, 0, None)
     if not hfile or hfile == INVALID_HANDLE:
-        return ''
-    try:
-        for alg in ('SHA256', 'SHA1'):
-            admin = w.HANDLE()
-            if not wt.CryptCATAdminAcquireContext2(ctypes.byref(admin), None, alg, None, 0):
-                continue
-            try:
-                signer = _catalog_signer_with(wt, admin, hfile, path)
-                if signer:
-                    return signer
-            finally:
-                wt.CryptCATAdminReleaseContext(admin, 0)
-        return ''
-    finally:
-        k32.CloseHandle(hfile)
+        raise _Unknown(f"cannot open {path}")
+    return hfile
 
 
-def _catalog_signer_with(wt, admin, hfile, path) -> str:
+def _signer_from_handle(path: str, hfile) -> str:
+    """Embedded signature, then catalogs. '' = definitively unsigned."""
+    info = WINTRUST_FILE_INFO(cbStruct=ctypes.sizeof(WINTRUST_FILE_INFO),
+                              pcwszFilePath=path, hFile=hfile)
+    return _verify(WTD_CHOICE_FILE, info) or _catalog_signer(path, hfile)
+
+
+def _catalog_signer(path: str, hfile) -> str:
+    wt = _api()['wt']
+    hashed = False
+    for alg in ('SHA256', 'SHA1'):
+        admin = w.HANDLE()
+        if not wt.CryptCATAdminAcquireContext2(ctypes.byref(admin), None, alg, None, 0):
+            continue
+        try:
+            signer, did_hash = _catalog_signer_with(wt, admin, hfile, path)
+            hashed = hashed or did_hash
+            if signer:
+                return signer
+        finally:
+            wt.CryptCATAdminReleaseContext(admin, 0)
+    if not hashed:
+        raise _Unknown("could not hash the file for catalog lookup")
+    return ''
+
+
+def _catalog_signer_with(wt, admin, hfile, path) -> tuple:
+    """(signer or '', whether the file was hashed). No catalog = ''."""
     size = w.DWORD(0)
     wt.CryptCATAdminCalcHashFromFileHandle2(admin, hfile, ctypes.byref(size), None, 0)
     if not size.value:
-        return ''
+        return '', False
     digest = (ctypes.c_ubyte * size.value)()
     if not wt.CryptCATAdminCalcHashFromFileHandle2(admin, hfile, ctypes.byref(size), digest, 0):
-        return ''
+        return '', False
     catinfo = wt.CryptCATAdminEnumCatalogFromHash(admin, digest, size.value, 0, None)
     if not catinfo:
-        return ''
+        return '', True
     try:
         ci = CATALOG_INFO(cbStruct=ctypes.sizeof(CATALOG_INFO))
         if not wt.CryptCATCatalogInfoFromContext(catinfo, ctypes.byref(ci), 0):
-            return ''
+            raise _Unknown("catalog info unavailable")
         tag = ''.join(f'{b:02X}' for b in digest)
         info = WINTRUST_CATALOG_INFO(
             cbStruct=ctypes.sizeof(WINTRUST_CATALOG_INFO), pcwszCatalogFilePath=ci.wszCatalogFile,
             pcwszMemberTag=tag, pcwszMemberFilePath=path, hMemberFile=hfile,
             pbCalculatedFileHash=digest, cbCalculatedFileHash=size.value, hCatAdmin=admin)
-        return _verify(WTD_CHOICE_CATALOG, info)
+        return _verify(WTD_CHOICE_CATALOG, info), True
     finally:
         wt.CryptCATAdminReleaseCatalogContext(admin, catinfo, 0)
 
 
-def signer_of(path: str) -> str:
+def signature(path: str) -> tuple:
+    """(signer, definitive). definitive=False means verification failed to
+    complete (I/O, crypto service, memory pressure): callers must treat the
+    signer as unknown, and it is not cached, so the next call retries."""
     if sys.platform != 'win32' or not path:
-        return ''
+        return '', True
     try:
         st = os.stat(path)
     except OSError:
-        return ''
+        return '', False
     key = (os.path.normcase(path), st.st_mtime_ns, st.st_size)
     with _cache_lock:
         if key in _cache:
-            return _cache[key]
+            return _cache[key], True
     try:
-        signer = _embedded_signer(path) or _catalog_signer(path)
+        hfile = _open(path, FILE_SHARE_ALL)
+        try:
+            signer = _signer_from_handle(path, hfile)
+        finally:
+            _api()['k32'].CloseHandle(hfile)
     except Exception:
-        signer = ''
+        return '', False
     with _cache_lock:
         _cache[key] = signer
-    return signer
+    return signer, True
+
+
+def signer_of(path: str) -> str:
+    """Signer organisation, '' when unsigned OR unknown (see signature())."""
+    return signature(path)[0]
+
+
+@contextlib.contextmanager
+def locked_signer(path: str):
+    """Open `path` denying writes, deletes and renames, verify it (never
+    cached), and keep it locked for the duration of the with-block, so a
+    launch inside the block runs exactly the bytes that were verified.
+    Yields the signer organisation ('' if unsigned or unverifiable)."""
+    if sys.platform != 'win32':
+        yield ''
+        return
+    try:
+        hfile = _open(str(path), FILE_SHARE_READ)
+    except _Unknown:
+        yield ''
+        return
+    try:
+        try:
+            signer = _signer_from_handle(str(path), hfile)
+        except Exception:
+            signer = ''
+        yield signer
+    finally:
+        _api()['k32'].CloseHandle(hfile)

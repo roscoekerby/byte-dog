@@ -34,6 +34,23 @@ class ProcessTools:
     def _status(self, msg, ok=True):
         self.app.report_status(msg, ok)
 
+    def _post(self, fn):
+        """Run fn on the Tk thread from a worker; harmless if ByteDog closed."""
+        try:
+            self.app.root.after(0, fn)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _in_background(self, name, work, done):
+        """work() on a worker thread, then done(result, error) on the Tk thread."""
+        def _run():
+            try:
+                result, err = work(), None
+            except Exception as e:
+                result, err = None, e
+            self._post(lambda: done(result, err))
+        threading.Thread(target=_run, daemon=True, name=name).start()
+
     def _allowed(self, pid, name, action, parent) -> bool:
         """Protected processes need the explicit override dialog."""
         if self.app._is_protected(name, pid):
@@ -83,11 +100,21 @@ class ProcessTools:
         def is_protected(child_pid):
             try:
                 child_name = psutil.Process(child_pid).name()
-            except psutil.Error:
+            except psutil.NoSuchProcess:
                 return False
+            except psutil.Error:
+                return True     # cannot verify -> leave it alone
             return self.app._is_protected(child_name, child_pid)
 
-        r = proc_actions.kill_tree(pid, is_protected)
+        self._status(f"Killing {name}'s process tree...")
+        self._in_background('ByteDogKillTree',
+                            lambda: proc_actions.kill_tree(pid, is_protected),
+                            lambda r, err: self._tree_killed(pid, name, r, err))
+
+    def _tree_killed(self, pid, name, r, err):
+        if err:
+            self._status(f"Kill tree of {name} failed: {err}", ok=False)
+            return
         for p in r.killed:
             self.app.guardian.suspended.pop(p, None)
         self.app.guardian.log_event('action', f"Killed tree of {name} (PID {pid}): "
@@ -109,10 +136,13 @@ class ProcessTools:
                                               f"with the same command line?\nUnsaved work in "
                                               f"it will be lost.", parent=parent):
             return
-        try:
-            new_pid = proc_actions.restart(pid)
-        except (psutil.Error, OSError) as e:
-            self._status(f"Restart of {name} failed: {e}", ok=False)
+        self._status(f"Restarting {name}...")
+        self._in_background('ByteDogRestart', lambda: proc_actions.restart(pid),
+                            lambda new_pid, err: self._restarted(pid, name, new_pid, err))
+
+    def _restarted(self, pid, name, new_pid, err):
+        if err:
+            self._status(f"Restart of {name} failed: {err}", ok=False)
             return
         self.app.guardian.suspended.pop(pid, None)
         self.app.guardian.log_event('action', f"Restarted {name}: PID {pid} -> {new_pid}")
@@ -180,11 +210,16 @@ class ProcessTools:
         self._status(f"Copied {field} of PID {pid}")
 
     def files_window(self, pid, name, parent):
-        try:
-            files, dlls = files_and_dlls(pid)
-        except psutil.Error as e:
-            self._status(f"Could not read open files of {name}: {e}", ok=False)
+        self._status(f"Reading open files and DLLs of {name}...")
+        self._in_background('ByteDogFiles', lambda: files_and_dlls(pid),
+                            lambda r, err: self._show_files(pid, name, parent, r, err))
+
+    def _show_files(self, pid, name, parent, result, err):
+        if err:
+            self._status(f"Could not read open files of {name}: {err}", ok=False)
             return
+        files, dlls = result
+        self._status(f"{name}: {len(files)} open files, {len(dlls)} modules")
         win = tk.Toplevel(parent)
         win.title(f"Open files & DLLs: {name} ({pid})")
         win.configure(bg=BG)
@@ -216,14 +251,8 @@ class ProcessTools:
             return
         self._status("Downloading Process Explorer from Microsoft...")
 
-        def _worker():
-            try:
-                exe2, err = sysinternals.download_procexp(), None
-            except sysinternals.ToolError as e:
-                exe2, err = None, str(e)
-            self.app.root.after(0, lambda: self._downloaded(exe2, err, pid))
-
-        threading.Thread(target=_worker, daemon=True, name='ByteDogProcexpFetch').start()
+        self._in_background('ByteDogProcexpFetch', sysinternals.download_procexp,
+                            lambda exe2, err: self._downloaded(exe2, err, pid))
 
     def _downloaded(self, exe, err, pid):
         if err:
@@ -266,8 +295,12 @@ class ProcessTools:
         tree.heading('pid', text='PID')
         tree.heading('app', text='App / service')
         tree.column('pid', width=70)
-        for h in holders:
-            tree.insert('', 'end', iid=str(h.pid), text=h.name, values=(h.pid, h.app))
+        apps = {}
+        for h in holders:     # several services in one svchost share a PID
+            apps.setdefault(h.pid, (h.name, []))[1].append(h.app)
+        for hpid, (hname, names) in apps.items():
+            tree.insert('', 'end', iid=str(hpid), text=hname,
+                        values=(hpid, ', '.join(n for n in names if n)))
         tree.pack(fill='both', expand=True, padx=10)
 
         def kill_selected():
@@ -307,7 +340,10 @@ class DetailsPane(tk.Frame):
         def _worker():
             d = proc_actions.details(pid)
             verdict = self.app._verdict(pid, name)
-            self.after(0, lambda: self._fill(pid, d, verdict))
+            try:
+                self.after(0, lambda: self._fill(pid, d, verdict))
+            except (RuntimeError, tk.TclError):
+                pass        # pane closed while loading
 
         threading.Thread(target=_worker, daemon=True, name='ByteDogDetails').start()
 

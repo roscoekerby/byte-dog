@@ -23,7 +23,7 @@ import queue
 
 from guardian import (
     DEFAULT_PROTECTED, GuardianConfig, EscalationEngine,
-    fast_memory_snapshot, select_targets, group_by_name,
+    fast_memory_snapshot, select_targets,
     harden_self, install_autostart, uninstall_autostart, autostart_installed,
     refresh_autostart,
     is_admin, relaunch_elevated, enable_debug_privilege, PROTECTED_INFO,
@@ -32,6 +32,7 @@ from guardian import (
 from hog_source import HogSource
 from safety import ProtectionChecker
 from process_tools_ui import DetailsPane, ProcessTools
+from guardian_toast import build_toast
 from hog_panel import HogPanel
 
 # GPU backend: NVML via nvidia-ml-py + PDH per-process VRAM (both in-process,
@@ -39,6 +40,7 @@ from hog_panel import HogPanel
 import gpu as gpu_backend
 
 GPU_AVAILABLE = gpu_backend.gpu_available()
+PROCESS_NAME_COLS = 30
 
 # Registry paths for the Startup tab. Same subpath convention as
 # guardian.AUTOSTART_KEY_PATH; StartupApproved holds the enable/disable
@@ -524,12 +526,12 @@ class ByteDogApp:
         self.guardian_alert_window = None
         self.safety = ProtectionChecker(
             user_names=lambda: {n.lower() for n in self.guardian.config.user_protected},
-            self_pid=os.getpid())
+            self_pid=os.getpid(),
+            self_exe=sys.executable if getattr(sys, 'frozen', False) else None)
         self.hog_source = HogSource(safety=self.safety)
         self.tools = ProcessTools(self)
         threading.Thread(target=self._warm_protection_cache, daemon=True,
                          name='ByteDogSafetyWarm').start()
-        self.hog_panel_window = None
 
         # Initialize CPU percent to prevent blocking
         psutil.cpu_percent(interval=None)
@@ -818,6 +820,7 @@ class ByteDogApp:
         # Guardian tab
         guardian_tab = ttk.Frame(notebook)
         notebook.add(guardian_tab, text='Guardian')
+        self.guardian_tab_frame = guardian_tab
         self.create_guardian_tab(guardian_tab)
 
         # Services tab
@@ -893,7 +896,10 @@ class ByteDogApp:
 
         # Hide all frames first
         for widget in self.root.winfo_children():
-            # Do not pack_forget menu; it's not a child widget, so safe regardless
+            # Popups (Guardian notice, dialogs) are Toplevels with no pack_forget;
+            # only the view frames are swapped here.
+            if isinstance(widget, (tk.Toplevel, tk.Menu)):
+                continue
             widget.pack_forget()
 
         if mode == "minimal":
@@ -1336,7 +1342,11 @@ class ByteDogApp:
         PID still belongs to a process with the name the user saw (and the
         protected check used) before acting on it."""
         try:
-            return psutil.Process(pid).name().lower() == (name or '').lower()
+            live, shown = psutil.Process(pid).name().lower(), (name or '').lower()
+            # Processes-tab rows truncate names to PROCESS_NAME_COLS characters
+            if len(shown) >= PROCESS_NAME_COLS:
+                return live.startswith(shown)
+            return live == shown
         except psutil.NoSuchProcess:
             return False
         except psutil.AccessDenied:
@@ -1366,23 +1376,19 @@ class ByteDogApp:
         return ok
 
     def open_hog_panel(self):
-        """Full, resizable hog panel (maximise with the window button or Maximise)."""
-        win = self.hog_panel_window
-        if win and win.winfo_exists():
-            win.deiconify()
-            win.lift()
-            win.focus_force()
-            return
-        win = tk.Toplevel(self.root)
-        win.title("ByteDog - Memory Hogs")
-        apply_window_icon(win)
-        win.configure(bg='#1a1a1a')
-        win.geometry("1150x680")
-        win.minsize(700, 300)
-        HogPanel(win, self).pack(fill='both', expand=True, padx=10, pady=10)
-        win.lift()
-        win.focus_force()
-        self.hog_panel_window = win
+        """The full hog panel lives in the main window's Guardian tab."""
+        self.open_guardian_tab()
+
+    def open_guardian_tab(self):
+        """Bring ByteDog forward in detailed view on the Guardian tab."""
+        if self.view_mode.get() != 'detailed':
+            self.set_view_mode('detailed')
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+        tab = getattr(self, 'guardian_tab_frame', None)
+        if tab is not None and hasattr(self, 'detailed_notebook'):
+            self.detailed_notebook.select(tab)
 
     def show_process_details(self):
         """Show detailed process information"""
@@ -1416,7 +1422,7 @@ class ByteDogApp:
         level). Name goes to the special '#0' tree column (text=), not
         `values` — see create_process_list. Returns the new item iid."""
         tags = ('protected',) if self._is_protected(proc['name'], proc['pid']) else ()
-        return self.process_tree.insert(parent, 'end', text=proc['name'][:30], values=(
+        return self.process_tree.insert(parent, 'end', text=proc['name'][:PROCESS_NAME_COLS], values=(
             proc['pid'],
             f"{proc.get('cpu_percent', 0):.1f}",
             f"{proc.get('memory_percent', 0):.1f}",
@@ -1527,12 +1533,12 @@ class ByteDogApp:
             for p in fast_memory_snapshot():
                 self.safety.check(p)
         except Exception as e:
-            print(f"Protection warm-up error: {e}")
+            self.guardian.log_event('warn', f"Protection warm-up failed: {e}")
 
     def _verdict(self, pid, name):
         """Verified protection (safety.ProtectionChecker): what Windows says
         about the process, not its name."""
-        return self.safety.check({'pid': int(pid), 'name': name or ''})
+        return self.safety.check_pid(int(pid), name or '')
 
     def _is_protected(self, name, pid) -> bool:
         return self._verdict(pid, name).protected
@@ -2144,109 +2150,46 @@ Created with Python and psutil
                 return
             existing.destroy()
 
-        alert = tk.Toplevel(self.root)
-        alert.tier = tier
-        alert.title("ByteDog Guardian")
-        apply_window_icon(alert)
-        alert.attributes('-topmost', True)
-        alert.configure(bg='#1a1a1a')
-        alert.minsize(420, 360)
-
-        screen_w = alert.winfo_screenwidth()
-        alert.geometry(f"640x500+{screen_w - 660}+80")
-
-        headers = {
-            'warn': ('#ff9800', '! WARNING'),
-            'suspend': ('#e64a19', '!! SUSPENDING HOG'),
-            'kill': ('#f44336', '!!! KILLING HOG'),
-        }
-        hdr_color, icon = headers.get(tier, headers['warn'])
-
-        hdr = tk.Frame(alert, bg=hdr_color)
-        hdr.pack(fill='x')
-        tk.Label(hdr, text=f"  RAM GUARDIAN {icon}",
-                 bg=hdr_color, fg='white', font=('Arial', 11, 'bold'),
-                 anchor='w').pack(fill='x', padx=8, pady=6)
-
-        body = tk.Frame(alert, bg='#1a1a1a')
-        body.pack(fill='both', expand=True, padx=10, pady=8)
-
-        ram_pct = event['ram_pct']
-        used = event.get('used_gb', 0)
-        total = event.get('total_gb', 0)
-        tk.Label(body, text=f"RAM Usage: {ram_pct:.1f}%  ({used:.1f} / {total:.0f} GB)",
-                 bg='#1a1a1a', fg='white', font=('Arial', 10, 'bold')).pack(anchor='w')
-
-        bar_frame = tk.Frame(body, bg='#1a1a1a')
-        bar_frame.pack(fill='x', pady=(2, 6))
-        bar_bg = tk.Canvas(bar_frame, height=8, bg='#333333', highlightthickness=0)
-        bar_bg.pack(fill='x')
-        bar_bg.update_idletasks()
-        bar_w = bar_bg.winfo_width() or 330
-        fill_w = int(bar_w * ram_pct / 100)
-        fill_color = '#f44336' if ram_pct >= self.guardian.config.act_pct else '#ff9800'
-        bar_bg.create_rectangle(0, 0, fill_w, 8, fill=fill_color, outline='')
-
-        self.guardian_alert_action = tk.Label(body, text="",
-                                              bg='#1a1a1a', fg='#4caf50',
-                                              font=('Arial', 8, 'bold'),
-                                              wraplength=600, justify='left')
-        self.guardian_alert_action.pack(side='bottom', anchor='w', pady=(4, 0))
-
-        tk.Label(body, text="Processes, ranked in the order Suspend Top / Kill Top Hog act:",
-                 bg='#1a1a1a', fg='#aaaaaa', font=('Arial', 8)).pack(anchor='w')
-        self.guardian_alert_panel = HogPanel(body, self, compact=True)
-        self.guardian_alert_panel.pack(fill='both', expand=True)
-
-        # Rescue buttons
-        btns = tk.Frame(alert, bg='#1a1a1a')
-        btns.pack(fill='x', padx=10, pady=(0, 4))
-        for label, cmd in (("Kill Top Hog", self._kill_top_hog_now),
-                           ("Suspend Top", self._suspend_top_hog_now),
-                           ("Resume All", self._resume_all_suspended)):
-            tk.Button(btns, text=label, bg='#2d2d2d', fg='white',
-                      relief='flat', font=('Arial', 8),
-                      command=lambda c=cmd: (setattr(alert, 'in_use', True), c())
-                      ).pack(side='left', padx=(0, 4))
-
-        footer = tk.Frame(alert, bg='#1a1a1a')
-        footer.pack(fill='x', padx=10, pady=(0, 8))
-        countdown_lbl = tk.Label(footer, text="", bg='#1a1a1a', fg='#555555',
-                                 font=('Arial', 7))
-        countdown_lbl.pack(side='left')
-        tk.Button(footer, text="Dismiss", bg='#2d2d2d', fg='white',
-                  relief='flat', font=('Arial', 8),
-                  command=alert.destroy).pack(side='right')
-
-        self.guardian_alert_window = alert
-
-        if tier == 'warn':
-            def _countdown(n):
-                if alert.winfo_exists():
-                    if getattr(alert, 'in_use', False):
-                        countdown_lbl.config(text="Kept open while you use it")
-                    elif n > 0:
-                        countdown_lbl.config(text=f"Closing in {n}s")
-                        alert.after(1000, lambda: _countdown(n - 1))
-                    else:
-                        alert.destroy()
-            alert.after(1000, lambda: _countdown(14))
+        self.guardian_alert_window = build_toast(self, event, apply_window_icon)
+        self.update_alert_hogs()
 
     def update_alert_hogs(self, action_msg=None):
-        """Rescan the open alert's hog panel and show the action taken. With no
-        alert open (actions from the main window) the message goes to the
-        status bar instead of being dropped."""
+        """Refresh the notice's next-target line and the Guardian tab's hog
+        panel, and show the action taken. With no notice open the message
+        goes to the status bar instead of being dropped."""
+        panel = getattr(self, 'guardian_panel', None)
+        if panel and panel.winfo_exists():
+            panel.refresh()
         alert = self.guardian_alert_window
         if not (alert and alert.winfo_exists()):
             if action_msg and hasattr(self, 'status_label'):
                 self.status_label.config(text=action_msg)
             return
-        panel = getattr(self, 'guardian_alert_panel', None)
-        if panel and panel.winfo_exists():
-            panel.refresh()
-        if action_msg and hasattr(self, 'guardian_alert_action') \
-                and self.guardian_alert_action.winfo_exists():
-            self.guardian_alert_action.config(text=f"Action: {action_msg}")
+        if action_msg and self.guardian_alert_action.winfo_exists():
+            self.guardian_alert_action.config(text=action_msg)
+
+        def _worker():
+            try:
+                t = self._select_top_target()
+            except Exception as e:
+                t, err = None, e
+            else:
+                err = None
+            text = (f"Could not scan processes: {err}" if err else
+                    f"Next target: {t['name']} (PID {t['pid']}, "
+                    f"{t['rss'] / (1024 ** 3):.2f} GB)" if t else
+                    "No eligible target (everything left is protected)")
+            try:
+                self.root.after(0, lambda: self._set_alert_next(text))
+            except (RuntimeError, tk.TclError):
+                pass        # ByteDog closing
+
+        threading.Thread(target=_worker, daemon=True, name='ByteDogToastTarget').start()
+
+    def _set_alert_next(self, text):
+        label = getattr(self, 'guardian_alert_next', None)
+        if label is not None and label.winfo_exists():
+            label.config(text=text)
 
     def create_guardian_tab(self, parent):
         """Create the RAM Guardian tab in the detailed view."""
@@ -2330,9 +2273,11 @@ Created with Python and psutil
                   bg='#5a1a1a', fg='white', font=('Arial', 8),
                   relief='flat', command=self._kill_top_hog_now
                   ).pack(side='right')
-        tk.Button(ram_row, text="Hog Panel",
-                  bg=self.colors['button'], fg='white', font=('Arial', 8),
-                  relief='flat', command=self.open_hog_panel
+        tk.Button(ram_row, text="Suspend Top", bg=self.colors['button'], fg='white',
+                  font=('Arial', 8), relief='flat', command=self._suspend_top_hog_now
+                  ).pack(side='right', padx=(0, 6))
+        tk.Button(ram_row, text="Resume All", bg=self.colors['button'], fg='white',
+                  font=('Arial', 8), relief='flat', command=self._resume_all_suspended
                   ).pack(side='right', padx=(0, 6))
 
         # ── Divider ──
@@ -2342,22 +2287,17 @@ Created with Python and psutil
         split = tk.Frame(parent, bg=bg)
         split.pack(fill='both', expand=True, padx=12)
 
-        left = tk.Frame(split, bg=bg)
-        left.pack(side='left', fill='both', expand=True)
-
-        tk.Label(left, text="Top Memory Hogs", bg=bg, fg=fg,
-                 font=('Arial', 9, 'bold')).pack(anchor='w')
-        self.guardian_hogs_text = tk.Text(left, height=7, bg=self.colors['button'],
-                                          fg=fg, font=('Consolas', 8),
-                                          state='disabled', width=22, relief='flat')
-        self.guardian_hogs_text.pack(fill='both', expand=True, pady=2)
+        tk.Label(split, text="Processes, ranked in the order Suspend Top / Kill Top Hog act",
+                 bg=bg, fg=fg, font=('Arial', 9, 'bold')).pack(anchor='w')
+        self.guardian_panel = HogPanel(split, self)
+        self.guardian_panel.pack(fill='both', expand=True, pady=(2, 4))
 
         right = tk.Frame(split, bg=bg)
-        right.pack(side='right', fill='both', expand=True, padx=(6, 0))
+        right.pack(fill='x')
 
         tk.Label(right, text="Event Log", bg=bg, fg=fg,
                  font=('Arial', 9, 'bold')).pack(anchor='w')
-        self.guardian_log_text = tk.Text(right, height=7, bg=self.colors['button'],
+        self.guardian_log_text = tk.Text(right, height=5, bg=self.colors['button'],
                                          fg=fg, font=('Consolas', 7),
                                          state='disabled', width=28, relief='flat')
         self.guardian_log_text.pack(fill='both', expand=True, pady=2)
@@ -2988,7 +2928,7 @@ Created with Python and psutil
 
     def update_guardian_tab(self):
         """Refresh guardian tab — RAM instantly, process hogs from cache only."""
-        if not hasattr(self, 'guardian_hogs_text'):
+        if not hasattr(self, 'guardian_ram_lbl'):
             return
 
         mem = self.monitor.get_memory_info()
@@ -3007,23 +2947,12 @@ Created with Python and psutil
         self.guardian_ram_lbl.config(
             text=f"{ram_pct:.1f}%  ({used_gb:.1f} / {total_gb:.0f} GB)", fg=r_color)
 
-        # Top hogs — live Norton-safe snapshot (~4ms), grouped per app
+        # Live Norton-safe snapshot (~5ms) feeds leak tracking below; the
+        # hog list itself is the hog panel above
         try:
             snap = fast_memory_snapshot()
         except Exception:
             snap = []
-
-        self.guardian_hogs_text.config(state='normal')
-        self.guardian_hogs_text.delete(1.0, tk.END)
-        if snap:
-            for g in group_by_name(snap)[:8]:
-                gb = g['rss'] / (1024 ** 3)
-                count = f" x{g['count']}" if g['count'] > 1 else ""
-                self.guardian_hogs_text.insert(
-                    tk.END, f"{g['name'][:15]:<15} {gb:5.2f}GB{count}\n")
-        else:
-            self.guardian_hogs_text.insert(tk.END, "  snapshot unavailable\n")
-        self.guardian_hogs_text.config(state='disabled')
 
         # Event log (instant — reads from deque)
         level_icons = {'info': ' ', 'warn': '!', 'critical': '!!', 'action': '>'}

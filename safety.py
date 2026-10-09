@@ -21,7 +21,9 @@ import threading
 from dataclasses import dataclass
 from typing import Callable
 
-from signing import signer_of
+import psutil
+
+from signing import signature
 
 PSEUDO_PROCESS_NAMES = frozenset({
     'system', 'registry', 'memory compression', 'memcompression', 'secure system',
@@ -29,7 +31,7 @@ PSEUDO_PROCESS_NAMES = frozenset({
 })
 KERNEL_PIDS = frozenset({0, 4})
 UNTRUSTED_WINDOWS_SUBDIRS = ('temp',)
-MICROSOFT_SIGNER_PREFIX = 'microsoft'
+MICROSOFT_SIGNERS = frozenset({'microsoft corporation', 'microsoft windows'})
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,7 @@ class Facts:
     ppl: int            # 0 none, 1 protected light, 2 protected
     signer: str         # organisation of the leaf signing cert, '' if unsigned
     opened: bool        # could ByteDog open the process at all
+    signer_known: bool = True   # False: verification failed to complete (not cached)
 
 
 @dataclass(frozen=True)
@@ -62,11 +65,17 @@ def _in_windows_dir(path: str, windows_dir: str) -> bool:
     return rel.split(os.sep)[0] not in UNTRUSTED_WINDOWS_SUBDIRS
 
 
-def decide(f: Facts, windows_dir: str, user_names=frozenset(), self_pid=None) -> Verdict:
+def is_microsoft(signer: str) -> bool:
+    return (signer or '').lower() in MICROSOFT_SIGNERS
+
+
+def decide(f: Facts, windows_dir: str, user_names=frozenset(), self_pid=None,
+           self_exe: str | None = None) -> Verdict:
     """Pure protection decision from gathered facts."""
     name = (f.name or '').lower()
     v = lambda reason: Verdict(True, reason, f.path, f.signer)  # noqa: E731
-    if f.pid == self_pid:
+    if f.pid == self_pid or (self_exe and f.path and
+                             os.path.normcase(f.path) == os.path.normcase(self_exe)):
         return v("ByteDog itself")
     if name in {n.lower() for n in user_names}:
         return v("On your never-touch list")
@@ -76,11 +85,14 @@ def decide(f: Facts, windows_dir: str, user_names=frozenset(), self_pid=None) ->
         return v("Windows marks this process critical: killing it crashes Windows (blue screen)")
     if f.ppl:
         return v("Windows protected process: the OS restricts touching it")
-    if not f.opened:
+    if not f.opened or not f.path or f.critical is None:
         return v("Could not verify this process (access denied), treated as protected")
-    if f.path and f.signer.lower().startswith(MICROSOFT_SIGNER_PREFIX) \
-            and _in_windows_dir(f.path, windows_dir):
-        return v("Microsoft-signed Windows component")
+    if _in_windows_dir(f.path, windows_dir):
+        if not f.signer_known:
+            return v("Windows-folder program whose signature could not be checked right "
+                     "now, treated as protected")
+        if is_microsoft(f.signer):
+            return v("Microsoft-signed Windows component")
     return Verdict(False, '', f.path, f.signer)
 
 
@@ -90,11 +102,12 @@ class ProtectionChecker:
     def __init__(self, gather: Callable[[int, str], Facts] | None = None,
                  windows_dir: str | None = None,
                  user_names: Callable[[], set] = lambda: frozenset(),
-                 self_pid: int | None = None):
+                 self_pid: int | None = None, self_exe: str | None = None):
         self._gather = gather or gather_facts
         self._windows_dir = windows_dir or os.environ.get('SystemRoot', r'C:\Windows')
         self._user_names = user_names
         self._self_pid = self_pid
+        self._self_exe = self_exe
         self._lock = threading.Lock()
         self._facts = {}    # pid -> (ctime, Facts)
 
@@ -102,19 +115,25 @@ class ProtectionChecker:
         pid, ctime = p['pid'], p.get('ctime')
         with self._lock:
             cached = self._facts.get(pid)
-        # ctime None (caller without a snapshot, e.g. a Processes tab row)
-        # reuses whatever is cached for the PID; callers re-check the name
-        # before acting (bytedog._same_process) to cover PID reuse.
-        if cached and (ctime is None or cached[0] == ctime):
+        # Cached per (pid, start time in ms). Without a start time (process
+        # gone) nothing is cached; nor are facts whose signature check did
+        # not complete, so they are retried instead of trusted.
+        if cached and ctime is not None and cached[0] == ctime:
             return cached[1]
         facts = self._gather(pid, p.get('name') or '')
-        with self._lock:
-            self._facts[pid] = (ctime, facts)
+        if ctime is not None and facts.signer_known:
+            with self._lock:
+                self._facts[pid] = (ctime, facts)
         return facts
 
     def check(self, p: dict) -> Verdict:
-        return decide(self.facts(p), self._windows_dir,
-                      user_names=self._user_names(), self_pid=self._self_pid)
+        return decide(self.facts(p), self._windows_dir, user_names=self._user_names(),
+                      self_pid=self._self_pid, self_exe=self._self_exe)
+
+    def check_pid(self, pid: int, name: str) -> Verdict:
+        """For callers without a snapshot: identifies the process by its live
+        start time, so a cached verdict never outlives PID reuse."""
+        return self.check({'pid': pid, 'name': name, 'ctime': ctime_ms(pid)})
 
     def prune(self, live_pids) -> None:
         live = set(live_pids)
@@ -145,7 +164,18 @@ def gather_facts(pid: int, name: str) -> Facts:
         ppl = (prot.value & 0x7) if status == 0 else 0
     finally:
         k32.CloseHandle(h)
-    return Facts(pid, name, path, critical, ppl, signer_of(path) if path else '', True)
+    signer, known = '', True
+    if path and _in_windows_dir(path, os.environ.get('SystemRoot', r'C:\Windows')):
+        signer, known = signature(path)    # only Windows-folder binaries need it
+    return Facts(pid, name, path, critical, ppl, signer, True, known)
+
+
+def ctime_ms(pid: int) -> int | None:
+    """Process start time in ms since the epoch (matches snapshot 'ctime')."""
+    try:
+        return round(psutil.Process(pid).create_time() * 1000)
+    except psutil.Error:
+        return None
 
 
 def _image_path(k32, h) -> str:

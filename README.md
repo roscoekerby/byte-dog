@@ -22,8 +22,9 @@ before that point.
   per-process memory under WDDM, with NVML process lists as fallback
 - Process list with kill / suspend / resume
 - **RAM Guardian with escalating thrash prevention:**
-  - **Warn (default 75% RAM):** topmost alert with the hog panel (below) and
-    one-click Kill Top Hog / Suspend Top / Resume All buttons
+  - **Warn (default 75% RAM):** a small topmost notice naming the next target,
+    with Open ByteDog / Suspend Top / Resume All (auto-closes after 15s unless
+    you use it). The full controls live in the main window's Guardian tab
   - **Suspend (default 85%):** automatically freezes the top memory hog
     (reversible via Resume All)
   - **Kill (default 92%):** automatically kills the top hog, max 3 kills/min
@@ -31,10 +32,17 @@ before that point.
     even below the warn threshold
   - Chrome/Edge/Brave aware: only individual tab (renderer) processes are ever
     auto-targeted, never the browser itself
-  - Protected system-process list plus a user-editable "never touch" list
+  - **Verified protection, not a name list:** a process is protected when
+    Windows marks it critical (killing it blue-screens), runs it as a
+    protected process, or it is a Microsoft-signed binary under the Windows
+    folder (embedded or catalog signature, checked offline). Kernel
+    pseudo-processes, ByteDog itself, anything ByteDog cannot open, and your
+    "never touch" list are protected too. A fake `svchost.exe` in Temp is not
+    protected; the real one is. Protected processes need an explicit override
+    that says why
   - Alert-only mode if you want no automatic actions
-- **Hog panel** (in the Guardian alert, plus "Full view" / Tools > Memory Hog
-  Panel / Guardian tab > Hog Panel for a resizable, maximisable window):
+- **Hog panel** (main window, Guardian tab; also Tools > Memory Hog Panel and
+  the notice's Open ByteDog):
   - Every process, ranked in exactly the order Suspend Top / Kill Top Hog and
     the automatic guardian act (biggest single eligible process first). The
     highlighted row is the next target; unranked rows say why (protected,
@@ -56,6 +64,21 @@ before that point.
     `%APPDATA%\ByteDog\session_notes.json` until the transcript changes
 - Every suspend (automatic, Top button, hog panel, Processes tab) is tracked,
   so Resume All undoes all of them
+- **Process Explorer-style tools** (right-click in the Processes tab or hog
+  panel): kill process tree (protected descendants skipped), restart with the
+  same command line (an admin ByteDog relaunches non-admin apps without admin
+  rights), set priority, set CPU affinity, open file location, copy path /
+  command line, open files and DLLs
+- **Details pane** under the process list: image, command line, working
+  folder, parent, user, start time, priority, threads/handles, admin, verified
+  signer and protection reason
+- **Tools > Who Is Locking a File:** finds the processes holding a file open
+  (Windows Restart Manager, no admin needed) and can kill them, safeguarded
+- **Open in Process Explorer:** jumps to Microsoft Sysinternals Process
+  Explorer with the process selected. Uses your copy (PATH, `C:\Tools\Sysinternals`)
+  or downloads the official zip from Microsoft on request into
+  `%LOCALAPPDATA%\ByteDog\sysinternals`. Any copy must be Microsoft-signed or
+  ByteDog refuses to run it. (Sysinternals' licence does not allow bundling it.)
 - **Norton/AV-safe monitoring:** hog scans use a single kernel snapshot call
   (no per-process handle opens), ~5ms for 340 processes even with AV
   interception that makes psutil scans take 15+ seconds

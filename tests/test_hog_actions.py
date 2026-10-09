@@ -62,7 +62,9 @@ def test_action_message_without_alert_goes_to_status_bar(dog):
 
 
 def test_warn_alert_stays_open_while_in_use(dog, monkeypatch):
-    monkeypatch.setattr('hog_panel.HogPanel.refresh', lambda self: None)
+    from conftest import InlineThread
+    monkeypatch.setattr('hog_panel.HogPanel.refresh', lambda self, **k: None)
+    monkeypatch.setattr('bytedog.threading.Thread', InlineThread)
     dog.show_guardian_alert({'type': 'warn', 'ram_pct': 76.0, 'used_gb': 48, 'total_gb': 64})
     alert = dog.guardian_alert_window
     try:
