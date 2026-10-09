@@ -454,3 +454,86 @@ instance).
 between a "Phase 1" heading and an OLDER "Phase 2" heading came back empty, and
 `str.replace("", block)` inserted the block between every character). Fixed forward here;
 the bloated blob stays in history unless the branch is rewritten.
+
+# 2026-10-10: Per-process hog panel (suspend/kill specific processes, labelled)
+
+## Problem
+- Alert's "Top memory users" groups by name and includes protected processes, but
+  Suspend/Kill Top act on the biggest single eligible PID (select_targets). Display and
+  action use different rankings, so "Suspend Top" hit llama-server (0.7 GB) while the
+  list showed Chrome 7.7 GB at the top.
+- No way to act on one specific process from the alert.
+- Manual suspends from the Processes tab are not tracked, so Resume All misses them.
+- claude.exe x17 and chrome.exe x60 rows are anonymous.
+
+## Decisions (confirmed 2026-10-10)
+- Controls live in a hog panel (the alert's list, plus a maximisable Full view).
+- "Top" = biggest single eligible process; the panel shows that exact ranking with the
+  next target highlighted.
+- Claude rows: local info + an AI one-line summary.
+
+## Phase 1: labelling (guardian.py, pure + tested)
+- [x] `chromium_label(cmdline)`: renderer / extension / GPU / network / audio /
+      storage / utility / browser, from `--type=` and `--utility-sub-type=`; browser
+      process gets its window title(s)
+- [x] `claude_sessions()`: read `~/.claude/sessions/*.json` -> {pid: name, cwd, status,
+      sessionId}; plus the transcript's latest `ai-title` (read the tail only, bounded)
+- [x] `label_process(p)`: one string per PID for the panel
+- [x] Tests with fixture cmdlines and a temp sessions dir
+
+## Phase 2: hog panel (new modules `hog_panel.py` + `hog_source.py`, bytedog.py only wires it in)
+- [x] Per-app groups (expandable) -> per-PID rows: name, label, GB, state, protected
+      lock; sorted by RSS
+- [x] Row actions: Suspend / Resume / Kill (protected -> existing override dialog;
+      kill -> confirm, graceful close first)
+- [x] Next auto/Top target highlighted, using the same select_targets() call as the buttons
+- [x] "Full view" opens the same panel in a resizable window that can be maximised
+- [x] Refresh with the existing fast snapshot (Norton-safe); label lookups cached by PID
+
+## Phase 3: suspend tracking
+- [x] Every suspend (alert, panel, Processes tab) goes into `guardian.suspended`, so
+      Resume All covers it; resumed/dead PIDs are removed
+- [x] Panel and Processes tab show the suspended state
+
+## Phase 4: AI summary for Claude sessions
+- [x] On-demand "Summarise" per claude row (never automatic during a RAM alert: spawning
+      a model process under memory pressure makes it worse)
+- [x] Runs `claude -p --model haiku` headless with the last ~40 transcript messages
+      (text only, truncated), CREATE_NO_WINDOW, 60s timeout, on a worker thread;
+      uses your existing Claude Code login, so no API key and no new dependency
+- [x] Cache keyed by sessionId + transcript mtime in %APPDATA%\ByteDog
+- [x] Tests: prompt building + cache; subprocess mocked
+
+## Verification
+- [x] pytest green; live run: open the alert, confirm list order == target order,
+      suspend/resume a specific chrome renderer and a specific claude session, Resume All
+      undoes a Processes-tab suspend, Summarise returns a note for a live session
+
+## Review
+
+**Ordering root cause:** the alert listed RSS summed per app name (protected processes
+included) while Suspend Top / Kill Top Hog acted on `select_targets()`'s biggest single
+eligible PID. Now one ranking (`hog_model.build_rows` calls `select_targets` itself) feeds
+both the list and the buttons, and the next target is highlighted. Verified live: panel #1
+== `_select_top_target()` on the real desktop.
+
+**Built:** `proc_labels.py` (Chromium/WebView2 roles from cmdlines, Claude sessions from
+`~/.claude/sessions/<pid>.json` + transcript ai-title), `hog_model.py` (ranked rows, groups,
+RoleCache), `hog_source.py` (scan pipeline), `hog_panel.py` (widget in the alert + full
+window), `session_notes.py` (on-demand `claude -p --model haiku --tools "" --safe-mode
+--no-session-persistence`, cached per transcript mtime). `bytedog.py` gained shared
+`suspend_pid/resume_pid/kill_pid` used by the Processes tab and the panel, so every suspend
+is tracked and Resume All covers it.
+
+**Code review fixes (python-reviewer):** failed scans froze the panel (except-bound name
+used in a later lambda); a scan-wide lock could delay the emergency auto-act (now only the
+role cache is locked); transcripts created after the first scan were never found; kill
+failures from the main window were silent; the warn alert's 15s countdown could destroy
+it under an open confirm dialog (now pinned once used); a failed resume dropped tracking;
+the list jumped to the top every refresh; `claude.CMD` timeouts blocked ~20s because only
+cmd.exe was killed (now taskkill /T, proven by test); PID reuse (name re-check before
+acting, role cache keyed on pid + create time, unreadable cmdlines retried after 60s).
+Accepted: first scan reads every Chromium cmdline once (cached after).
+
+**Tests:** 101 pass, 6/6 repeated runs. One Tcl interpreter per session (conftest `dog`):
+a second `Tk()` per run flaked on init.tcl and could not be retried.

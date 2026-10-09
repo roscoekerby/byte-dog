@@ -22,8 +22,8 @@ before that point.
   per-process memory under WDDM, with NVML process lists as fallback
 - Process list with kill / suspend / resume
 - **RAM Guardian with escalating thrash prevention:**
-  - **Warn (default 75% RAM):** topmost alert with the biggest memory hogs
-    (grouped per app) and one-click Kill / Suspend / Resume buttons
+  - **Warn (default 75% RAM):** topmost alert with the hog panel (below) and
+    one-click Kill Top Hog / Suspend Top / Resume All buttons
   - **Suspend (default 85%):** automatically freezes the top memory hog
     (reversible via Resume All)
   - **Kill (default 92%):** automatically kills the top hog, max 3 kills/min
@@ -33,6 +33,29 @@ before that point.
     auto-targeted, never the browser itself
   - Protected system-process list plus a user-editable "never touch" list
   - Alert-only mode if you want no automatic actions
+- **Hog panel** (in the Guardian alert, plus "Full view" / Tools > Memory Hog
+  Panel / Guardian tab > Hog Panel for a resizable, maximisable window):
+  - Every process, ranked in exactly the order Suspend Top / Kill Top Hog and
+    the automatic guardian act (biggest single eligible process first). The
+    highlighted row is the next target; unranked rows say why (protected,
+    browser core, suspended)
+  - Suspend / Resume / Kill on any specific row (right-click works too);
+    protected processes still need the explicit override dialog
+  - Optional "Group by app" view (Chrome x60 -> expand to each process)
+  - Chrome/Edge/Brave/WebView2 processes labelled by role: tab / page,
+    extension, GPU, network / audio / storage service, browser (main) with its
+    window title. WebView2 rows name their host app (Teams, WhatsApp...).
+    Per-tab URLs are not exposed by Chromium to other processes, so roles are
+    the finest breakdown available
+  - Claude Code sessions (`claude.exe`) labelled with session name, busy/idle
+    status, auto title and folder, read from `~/.claude/sessions/<pid>.json`
+  - **AI note** on a Claude row: runs your own `claude` CLI headless
+    (`claude -p --model haiku`, no tools, no hooks/plugins, no session saved)
+    on the last ~40 messages for a one-line "what is this session doing".
+    About 10s, only on click (never during an alert), cached per session in
+    `%APPDATA%\ByteDog\session_notes.json` until the transcript changes
+- Every suspend (automatic, Top button, hog panel, Processes tab) is tracked,
+  so Resume All undoes all of them
 - **Norton/AV-safe monitoring:** hog scans use a single kernel snapshot call
   (no per-process handle opens), ~5ms for 340 processes even with AV
   interception that makes psutil scans take 15+ seconds
@@ -86,7 +109,7 @@ the Guardian tab of the detailed view and persisted to
 ## Testing
 
 ```
-python -m pytest tests/ -q          # unit tests (escalation engine, targeting, config)
+python -m pytest tests/ -q          # unit + Tk tests (engine, targeting, labels, hog panel, notes)
 python tests/balloon.py --target 76 # live demo: inflate RAM until the WARN alert fires
 python tests/balloon.py --target 86 # live demo: watch the balloon get auto-suspended
 python tests/balloon.py --target 93 # live demo: watch the balloon get auto-killed

@@ -359,7 +359,8 @@ def _snapshot_ntquery():
             name = (ctypes.wstring_at(img.Buffer, img.Length // 2)
                     if img.Buffer and img.Length else '?')
             procs.append({'pid': int(pid), 'name': name,
-                          'rss': int(info.WorkingSetSize)})
+                          'rss': int(info.WorkingSetSize),
+                          'ctime': int(info.CreateTime)})
         if info.NextEntryOffset == 0:
             break
         offset += info.NextEntryOffset
@@ -376,12 +377,13 @@ def fast_memory_snapshot():
             pass
     import psutil
     procs = []
-    for proc in psutil.process_iter(['pid', 'name', 'memory_info']):
+    for proc in psutil.process_iter(['pid', 'name', 'memory_info', 'create_time']):
         try:
             mi = proc.info.get('memory_info')
             procs.append({'pid': proc.info['pid'],
                           'name': proc.info.get('name') or '?',
-                          'rss': mi.rss if mi else 0})
+                          'rss': mi.rss if mi else 0,
+                          'ctime': proc.info.get('create_time')})
         except Exception:
             continue
     return procs

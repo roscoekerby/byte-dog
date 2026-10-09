@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 import pytest
-import tkinter as tk
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -27,21 +27,6 @@ def own_icon(window) -> int:
     return ctypes.windll.user32.SendMessageW(hwnd, 0x7F, 1, 0)
 
 pytestmark = pytest.mark.skipif(sys.platform != 'win32', reason='Windows taskbar behaviour')
-
-
-@pytest.fixture(scope='module')
-def dog():
-    """One ByteDogApp (one Tcl interpreter) for the module: creating and
-    destroying Tk() per test intermittently fails to read init.tcl on Windows."""
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(bytedog.ByteDogApp, 'start_monitoring', lambda self: None)
-        mp.setattr(bytedog.ByteDogApp, 'process_queue', lambda self: None)
-        application = bytedog.ByteDogApp()
-    yield application
-    try:
-        application.root.destroy()
-    except tk.TclError:
-        pass
 
 
 def test_run_reannounces_root_icon_inside_loop(dog, monkeypatch):

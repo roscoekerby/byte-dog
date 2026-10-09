@@ -23,12 +23,14 @@ import queue
 
 from guardian import (
     DEFAULT_PROTECTED, GuardianConfig, EscalationEngine,
-    fast_memory_snapshot, enrich_chromium, select_targets, group_by_name,
+    fast_memory_snapshot, select_targets, group_by_name,
     harden_self, install_autostart, uninstall_autostart, autostart_installed,
     refresh_autostart,
     is_admin, relaunch_elevated, enable_debug_privilege, protected_reason,
     graceful_close_process, collect_window_titles,
 )
+from hog_source import HogSource
+from hog_panel import HogPanel
 
 # GPU backend: NVML via nvidia-ml-py + PDH per-process VRAM (both in-process,
 # no subprocess — safe under pythonw, no console flashes)
@@ -518,6 +520,8 @@ class ByteDogApp:
         self.guardian = RAMGuardian()
         self.guardian_queue = queue.Queue()
         self.guardian_alert_window = None
+        self.hog_source = HogSource()
+        self.hog_panel_window = None
 
         # Initialize CPU percent to prevent blocking
         psutil.cpu_percent(interval=None)
@@ -851,6 +855,7 @@ class ByteDogApp:
         tools_menu.add_separator()
         tools_menu.add_command(label="Toggle RAM Guardian", command=self._menu_toggle_guardian)
         tools_menu.add_command(label="Resume Suspended Processes", command=self._resume_all_suspended)
+        tools_menu.add_command(label="Memory Hog Panel", command=self.open_hog_panel)
         tools_menu.add_separator()
         tools_menu.add_command(label="Install Auto-Start (login)", command=self._menu_install_autostart)
         tools_menu.add_command(label="Remove Auto-Start", command=self._menu_uninstall_autostart)
@@ -1206,18 +1211,20 @@ class ByteDogApp:
 
             menu.post(event.x_root, event.y_root)
 
-    def _show_protected_override_dialog(self, name, pid, action) -> bool:
+    def _show_protected_override_dialog(self, name, pid, action, parent=None) -> bool:
         """Modal warning for kill/suspend on a protected process: explains
         the specific consequence and requires an explicit 'Override' click
         rather than a plain Yes/No. Returns True only if the user overrides."""
         verb = 'Kill' if action == 'kill' else 'Suspend'
         result = {'override': False}
 
-        dialog = tk.Toplevel(self.root)
+        parent = parent or self.root
+        dialog = tk.Toplevel(parent)
         dialog.title(f"Protected Process — {name}")
         apply_window_icon(dialog)
         dialog.configure(bg=self.colors['bg'])
-        dialog.transient(self.root)
+        dialog.transient(parent)
+        dialog.attributes('-topmost', True)
         dialog.resizable(False, False)
 
         tk.Label(dialog, text=f"⚠ '{name}' (PID {pid}) is a protected process",
@@ -1249,71 +1256,118 @@ class ByteDogApp:
 
         dialog.protocol("WM_DELETE_WINDOW", _cancel)
         dialog.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        x = parent.winfo_x() + (parent.winfo_width() - dialog.winfo_width()) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - dialog.winfo_height()) // 2
         dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
         dialog.grab_set()
         dialog.wait_window()
         return result['override']
 
-    def kill_selected_process(self):
-        """Kill selected process — protected processes require an explicit
-        override through _show_protected_override_dialog instead of the
-        plain yes/no confirm."""
+    def _selected_process(self):
+        """(pid, name) of the Processes tab selection, or None."""
         if not hasattr(self, 'process_tree'):
-            return
+            return None
         selection = self.process_tree.selection()
         if not selection:
-            return
+            return None
         item = self.process_tree.item(selection[0])
-        pid, name = item['values'][0], item['text']
+        return item['values'][0], item['text']
 
-        if self._is_protected(name):
-            if not self._show_protected_override_dialog(name, pid, 'kill'):
-                return
-        elif not messagebox.askyesno("Confirm", f"Kill process '{name}' (PID: {pid})?"):
+    def _report_process_action(self, action, pid, ok):
+        if ok is None:
             return
-
-        if self.process_manager.kill_process(pid):
-            self.status_label.config(text=f"Killed process {pid}", foreground=self.colors['success'])
+        done = {'kill': 'Killed', 'suspend': 'Suspended', 'resume': 'Resumed'}[action]
+        if ok:
+            self.status_label.config(text=f"{done} process {pid}", foreground=self.colors['success'])
         else:
-            self.status_label.config(text=f"Failed to kill process {pid}", foreground=self.colors['error'])
+            self.status_label.config(text=f"Failed to {action} process {pid}",
+                                     foreground=self.colors['error'])
         self.refresh_processes()
+
+    def kill_selected_process(self):
+        sel = self._selected_process()
+        if sel:
+            self._report_process_action('kill', sel[0], self.kill_pid(*sel))
 
     def suspend_selected_process(self):
-        """Suspend selected process — protected processes require an
-        explicit override through _show_protected_override_dialog."""
-        if not hasattr(self, 'process_tree'):
-            return
-        selection = self.process_tree.selection()
-        if not selection:
-            return
-        item = self.process_tree.item(selection[0])
-        pid, name = item['values'][0], item['text']
-
-        if self._is_protected(name) and not self._show_protected_override_dialog(name, pid, 'suspend'):
-            return
-
-        if self.process_manager.suspend_process(pid):
-            self.status_label.config(text=f"Suspended process {pid}", foreground=self.colors['success'])
-        else:
-            self.status_label.config(text=f"Failed to suspend process {pid}", foreground=self.colors['error'])
-        self.refresh_processes()
+        sel = self._selected_process()
+        if sel:
+            self._report_process_action('suspend', sel[0], self.suspend_pid(*sel))
 
     def resume_selected_process(self):
-        """Resume selected process"""
-        if hasattr(self, 'process_tree'):
-            selection = self.process_tree.selection()
-            if selection:
-                item = self.process_tree.item(selection[0])
-                pid = item['values'][0]
+        sel = self._selected_process()
+        if sel:
+            self._report_process_action('resume', sel[0], self.resume_pid(*sel))
 
-                if self.process_manager.resume_process(pid):
-                    self.status_label.config(text=f"Resumed process {pid}", foreground=self.colors['success'])
-                else:
-                    self.status_label.config(text=f"Failed to resume process {pid}", foreground=self.colors['error'])
-                self.refresh_processes()
+    # ── Per-process actions shared by the Processes tab and the hog panel.
+    # Return True/False for success, None when the user cancelled. Every
+    # suspend is recorded in guardian.suspended so Resume All undoes it.
+
+    def suspend_pid(self, pid, name, parent=None):
+        if not self._same_process(pid, name):
+            return False
+        if self._is_protected(name) and not self._show_protected_override_dialog(
+                name, pid, 'suspend', parent):
+            return None
+        if not self.process_manager.suspend_process(pid):
+            return False
+        self.guardian.suspended[pid] = name
+        self.guardian.log_event('action', f"Manual suspend: {name} (PID {pid})")
+        return True
+
+    def _same_process(self, pid, name):
+        """Guard against PID reuse: the row may be seconds old, so confirm the
+        PID still belongs to a process with the name the user saw (and the
+        protected check used) before acting on it."""
+        try:
+            return psutil.Process(pid).name().lower() == (name or '').lower()
+        except psutil.NoSuchProcess:
+            return False
+        except psutil.AccessDenied:
+            return True
+
+    def resume_pid(self, pid, name, parent=None):
+        ok = self.process_manager.resume_process(pid)
+        if ok or not psutil.pid_exists(pid):
+            self.guardian.suspended.pop(pid, None)
+        if ok:
+            self.guardian.log_event('action', f"Resumed {name} (PID {pid})")
+        return ok
+
+    def kill_pid(self, pid, name, parent=None):
+        if not self._same_process(pid, name):
+            return False
+        if self._is_protected(name):
+            if not self._show_protected_override_dialog(name, pid, 'kill', parent):
+                return None
+        elif not messagebox.askyesno("Confirm", f"Kill process '{name}' (PID: {pid})?",
+                                     parent=parent or self.root):
+            return None
+        ok = self.process_manager.kill_process(pid)
+        if ok:
+            self.guardian.suspended.pop(pid, None)
+            self.guardian.log_event('action', f"Manual kill: {name} (PID {pid})")
+        return ok
+
+    def open_hog_panel(self):
+        """Full, resizable hog panel (maximise with the window button or Maximise)."""
+        win = self.hog_panel_window
+        if win and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+            return
+        win = tk.Toplevel(self.root)
+        win.title("ByteDog - Memory Hogs")
+        apply_window_icon(win)
+        win.configure(bg='#1a1a1a')
+        win.geometry("1150x680")
+        win.minsize(700, 300)
+        HogPanel(win, self).pack(fill='both', expand=True, padx=10, pady=10)
+        win.lift()
+        win.focus_force()
+        self.hog_panel_window = win
 
     def show_process_details(self):
         """Show detailed process information"""
@@ -1967,12 +2021,11 @@ Created with Python and psutil
 
         def _worker():
             try:
-                procs = enrich_chromium(fast_memory_snapshot())
-                groups = group_by_name(procs)[:6]
+                procs = self.hog_source.procs()
                 action_msg = None
                 if tier in ('suspend', 'kill'):
                     action_msg = self._auto_act(tier, procs)
-                self.root.after(0, lambda: self.update_alert_hogs(groups, action_msg))
+                self.root.after(0, lambda: self.update_alert_hogs(action_msg))
             except Exception as e:
                 print(f"Guardian worker error: {e}")
 
@@ -2013,15 +2066,20 @@ Created with Python and psutil
         return msg
 
     def _resume_all_suspended(self):
-        """Resume everything the guardian auto-suspended."""
+        """Resume everything ByteDog suspended (auto, Top button, hog panel
+        and Processes tab all record into guardian.suspended)."""
         if not self.guardian.suspended:
+            self.update_alert_hogs("Nothing to resume: no processes suspended by ByteDog")
             return
-        for pid, name in list(self.guardian.suspended.items()):
-            if self.process_manager.resume_process(pid):
-                self.guardian.log_event('action', f"Resumed {name} (PID {pid})")
-            self.guardian.suspended.pop(pid, None)
+        resumed = sum(bool(self.resume_pid(pid, name))
+                      for pid, name in list(self.guardian.suspended.items()))
+        stuck = len(self.guardian.suspended)
+        msg = f"Resumed {resumed} suspended process(es)" + (
+            f"; {stuck} could not be resumed (access denied), Resume All will retry"
+            if stuck else "")
         if hasattr(self, 'status_label'):
-            self.status_label.config(text="Resumed suspended processes")
+            self.status_label.config(text=msg)
+        self.update_alert_hogs(msg)
 
     TIER_RANK = {'warn': 0, 'suspend': 1, 'kill': 2}
 
@@ -2042,10 +2100,10 @@ Created with Python and psutil
         apply_window_icon(alert)
         alert.attributes('-topmost', True)
         alert.configure(bg='#1a1a1a')
-        alert.resizable(False, False)
+        alert.minsize(420, 360)
 
         screen_w = alert.winfo_screenwidth()
-        alert.geometry(f"360x300+{screen_w - 380}+80")
+        alert.geometry(f"640x500+{screen_w - 660}+80")
 
         headers = {
             'warn': ('#ff9800', '! WARNING'),
@@ -2079,18 +2137,16 @@ Created with Python and psutil
         fill_color = '#f44336' if ram_pct >= self.guardian.config.act_pct else '#ff9800'
         bar_bg.create_rectangle(0, 0, fill_w, 8, fill=fill_color, outline='')
 
-        tk.Label(body, text="Top memory users:",
-                 bg='#1a1a1a', fg='#aaaaaa', font=('Arial', 8)).pack(anchor='w')
-        self.guardian_alert_hogs = tk.Label(body, text="  scanning...",
-                                            bg='#1a1a1a', fg='white',
-                                            font=('Consolas', 8), justify='left')
-        self.guardian_alert_hogs.pack(anchor='w')
-
         self.guardian_alert_action = tk.Label(body, text="",
                                               bg='#1a1a1a', fg='#4caf50',
                                               font=('Arial', 8, 'bold'),
-                                              wraplength=330, justify='left')
-        self.guardian_alert_action.pack(anchor='w', pady=(4, 0))
+                                              wraplength=600, justify='left')
+        self.guardian_alert_action.pack(side='bottom', anchor='w', pady=(4, 0))
+
+        tk.Label(body, text="Processes, ranked in the order Suspend Top / Kill Top Hog act:",
+                 bg='#1a1a1a', fg='#aaaaaa', font=('Arial', 8)).pack(anchor='w')
+        self.guardian_alert_panel = HogPanel(body, self, compact=True)
+        self.guardian_alert_panel.pack(fill='both', expand=True)
 
         # Rescue buttons
         btns = tk.Frame(alert, bg='#1a1a1a')
@@ -2100,7 +2156,8 @@ Created with Python and psutil
                            ("Resume All", self._resume_all_suspended)):
             tk.Button(btns, text=label, bg='#2d2d2d', fg='white',
                       relief='flat', font=('Arial', 8),
-                      command=cmd).pack(side='left', padx=(0, 4))
+                      command=lambda c=cmd: (setattr(alert, 'in_use', True), c())
+                      ).pack(side='left', padx=(0, 4))
 
         footer = tk.Frame(alert, bg='#1a1a1a')
         footer.pack(fill='x', padx=10, pady=(0, 8))
@@ -2116,25 +2173,27 @@ Created with Python and psutil
         if tier == 'warn':
             def _countdown(n):
                 if alert.winfo_exists():
-                    if n > 0:
+                    if getattr(alert, 'in_use', False):
+                        countdown_lbl.config(text="Kept open while you use it")
+                    elif n > 0:
                         countdown_lbl.config(text=f"Closing in {n}s")
                         alert.after(1000, lambda: _countdown(n - 1))
                     else:
                         alert.destroy()
             alert.after(1000, lambda: _countdown(14))
 
-    def update_alert_hogs(self, groups, action_msg=None):
-        """Fill the open alert with grouped hog totals and the action taken."""
+    def update_alert_hogs(self, action_msg=None):
+        """Rescan the open alert's hog panel and show the action taken. With no
+        alert open (actions from the main window) the message goes to the
+        status bar instead of being dropped."""
         alert = self.guardian_alert_window
         if not (alert and alert.winfo_exists()):
+            if action_msg and hasattr(self, 'status_label'):
+                self.status_label.config(text=action_msg)
             return
-        if hasattr(self, 'guardian_alert_hogs') and self.guardian_alert_hogs.winfo_exists():
-            lines = []
-            for g in groups:
-                gb = g['rss'] / (1024 ** 3)
-                count = f" x{g['count']}" if g['count'] > 1 else ""
-                lines.append(f"  {g['name'][:22]:<22} {gb:5.1f} GB{count}")
-            self.guardian_alert_hogs.config(text="\n".join(lines) or "  (no data)")
+        panel = getattr(self, 'guardian_alert_panel', None)
+        if panel and panel.winfo_exists():
+            panel.refresh()
         if action_msg and hasattr(self, 'guardian_alert_action') \
                 and self.guardian_alert_action.winfo_exists():
             self.guardian_alert_action.config(text=f"Action: {action_msg}")
@@ -2221,6 +2280,10 @@ Created with Python and psutil
                   bg='#5a1a1a', fg='white', font=('Arial', 8),
                   relief='flat', command=self._kill_top_hog_now
                   ).pack(side='right')
+        tk.Button(ram_row, text="Hog Panel",
+                  bg=self.colors['button'], fg='white', font=('Arial', 8),
+                  relief='flat', command=self.open_hog_panel
+                  ).pack(side='right', padx=(0, 6))
 
         # ── Divider ──
         tk.Frame(parent, height=1, bg=self.colors['select']).pack(fill='x', padx=12, pady=4)
@@ -2819,47 +2882,58 @@ Created with Python and psutil
         self.guardian.log_event('info', f"Protected list: {len(names)} extra names")
 
     def _select_top_target(self):
-        """Fast snapshot -> top eligible target. Returns (target, groups) or (None, groups)."""
-        procs = enrich_chromium(fast_memory_snapshot())
+        """Top eligible target, ranked exactly as the hog panel shows it."""
         targets = select_targets(
-            procs, self.guardian.config.protected_names(),
+            self.hog_source.procs(), self.guardian.config.protected_names(),
             suspended_pids=set(self.guardian.suspended), self_pid=os.getpid())
-        return (targets[0] if targets else None), group_by_name(procs)[:6]
+        return targets[0] if targets else None
+
+    def _alert_or_root(self):
+        alert = self.guardian_alert_window
+        return alert if alert and alert.winfo_exists() else self.root
 
     def _kill_top_hog_now(self):
-        """Snapshot, confirm, kill the top hog."""
+        """Snapshot, confirm, kill the top hog (the panel's highlighted row)."""
         def _worker():
-            target, groups = self._select_top_target()
+            target = self._select_top_target()
+
             def _confirm():
-                self.update_alert_hogs(groups)
+                parent = self._alert_or_root()
                 if not target:
-                    messagebox.showinfo("Guardian", "No killable processes found.")
+                    messagebox.showinfo("Guardian", "No killable processes found.", parent=parent)
                     return
                 name, pid, gb = target['name'], target['pid'], target['rss'] / (1024 ** 3)
-                if messagebox.askyesno("Kill Process",
-                                       f"Kill '{name}' (PID {pid}, {gb:.1f} GB)?"):
-                    if self.process_manager.kill_process(pid):
-                        self.guardian.log_event('action', f"Manual kill: {name} (PID {pid})")
-                    else:
-                        messagebox.showerror("Guardian",
-                                             f"Could not kill '{name}' — may need admin rights.")
+                if not messagebox.askyesno("Kill Process",
+                                           f"Kill '{name}' (PID {pid}, {gb:.1f} GB)?",
+                                           parent=parent):
+                    return
+                if self.process_manager.kill_process(pid):
+                    self.guardian.suspended.pop(pid, None)
+                    msg = f"Killed {name} (PID {pid}, {gb:.1f} GB freed)"
+                    self.guardian.log_event('action', f"Manual kill: {name} (PID {pid})")
+                else:
+                    msg = f"Could not kill {name} (PID {pid}): may need admin rights"
+                    if parent is self.root:
+                        messagebox.showerror("Guardian", msg, parent=parent)
+                self.update_alert_hogs(msg)
             self.root.after(0, _confirm)
         threading.Thread(target=_worker, daemon=True, name='ByteDogManualKill').start()
 
     def _suspend_top_hog_now(self):
-        """Snapshot and suspend the top hog (no confirm — it's reversible)."""
+        """Suspend the top hog (the panel's highlighted row). No confirm: reversible."""
         def _worker():
-            target, groups = self._select_top_target()
-            msg = None
+            target = self._select_top_target()
+            msg = "No eligible target (everything left is protected or suspended)"
             if target:
                 pid, name = target['pid'], target['name']
+                gb = target['rss'] / (1024 ** 3)
                 if self.process_manager.suspend_process(pid):
                     self.guardian.suspended[pid] = name
-                    msg = f"Suspended {name} (PID {pid}) — use Resume All to undo"
+                    msg = f"Suspended {name} (PID {pid}, {gb:.1f} GB frozen). Resume All undoes it"
                     self.guardian.log_event('action', msg)
                 else:
                     msg = f"Could not suspend {name} (PID {pid})"
-            self.root.after(0, lambda: self.update_alert_hogs(groups, msg))
+            self.root.after(0, lambda: self.update_alert_hogs(msg))
         threading.Thread(target=_worker, daemon=True, name='ByteDogManualSuspend').start()
 
     def update_guardian_tab(self):
