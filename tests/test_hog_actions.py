@@ -77,3 +77,21 @@ def test_warn_alert_stays_open_while_in_use(dog, monkeypatch):
         assert "Kept open while you use it" in texts
     finally:
         alert.destroy()
+
+
+def test_protection_is_verified_not_by_name(dog, tmp_path):
+    """The real winlogon is protected with a reason; a process merely named
+    svchost.exe outside Windows is not, and the guardian may target it."""
+    import shutil
+    winlogon = next(p for p in psutil.process_iter(['name']) if p.info['name'] == 'winlogon.exe')
+    assert dog._is_protected('winlogon.exe', winlogon.pid)
+    assert 'Why:' in dog._protection_text(winlogon.pid, 'winlogon.exe')
+    fake = tmp_path / 'svchost.exe'
+    shutil.copy(sys.executable, fake)
+    proc = subprocess.Popen([str(fake), '-c', 'import time; time.sleep(30)'],
+                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    try:
+        time.sleep(0.5)
+        assert not dog._is_protected('svchost.exe', proc.pid)
+    finally:
+        proc.kill()

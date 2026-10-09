@@ -26,6 +26,7 @@ class HogRow:
     protected: bool
     suspended: bool
     label: str = ''
+    why: str = ''        # verified protection reason (safety.Verdict.reason)
 
 
 @dataclass(frozen=True)
@@ -37,13 +38,13 @@ class HogGroup:
     rows: tuple
 
 
-def _reason(p: dict, protected: frozenset, suspended: set, self_pid) -> str:
+def _reason(p: dict, is_prot: bool, suspended: set, self_pid) -> str:
     name = (p.get('name') or '').lower()
     if p['pid'] == self_pid:
         return 'ByteDog'
     if p['pid'] in suspended:
         return 'suspended'
-    if name in protected:
+    if is_prot:
         return 'protected'
     if name in CHROMIUM_NAMES and p.get('ctype') != 'renderer':
         return 'browser core'
@@ -51,12 +52,22 @@ def _reason(p: dict, protected: frozenset, suspended: set, self_pid) -> str:
 
 
 def build_rows(procs: list, protected: frozenset, suspended_pids=frozenset(),
-               self_pid=None, labels: dict | None = None, min_rss: int = 0) -> list:
-    """Ranked targets first (select_targets order), then everything else by RSS."""
+               self_pid=None, labels: dict | None = None, min_rss: int = 0,
+               protection=None) -> list:
+    """Ranked targets first (select_targets order), then everything else by RSS.
+    `protection(p)` returns a safety.Verdict; without it, `protected` names decide."""
     labels = labels or {}
     suspended = set(suspended_pids)
+
+    def verdict(p):
+        if protection is not None:
+            v = protection(p)
+            return v.protected, v.reason
+        return (p.get('name') or '').lower() in protected, ''
+
     targets = select_targets(procs, protected, suspended_pids=suspended,
-                             n=len(procs), self_pid=self_pid)
+                             n=len(procs), self_pid=self_pid,
+                             is_protected=(lambda p: verdict(p)[0]) if protection else None)
     rank_of = {t['pid']: i + 1 for i, t in enumerate(targets)}
     rows = []
     for p in procs:
@@ -64,12 +75,12 @@ def build_rows(procs: list, protected: frozenset, suspended_pids=frozenset(),
         if rss < min_rss and p['pid'] not in suspended:
             continue
         rank = rank_of.get(p['pid'])
+        is_prot, why = verdict(p)
         rows.append(HogRow(
             pid=p['pid'], name=p.get('name') or '?', rss=rss, rank=rank,
-            reason='' if rank else _reason(p, protected, suspended, self_pid),
-            protected=(p.get('name') or '').lower() in protected,
-            suspended=p['pid'] in suspended,
-            label=labels.get(p['pid'], '')))
+            reason='' if rank else _reason(p, is_prot, suspended, self_pid),
+            protected=is_prot, suspended=p['pid'] in suspended,
+            label=labels.get(p['pid'], ''), why=why))
     return sorted(rows, key=lambda r: (r.rank is None, r.rank or 0, -r.rss))
 
 

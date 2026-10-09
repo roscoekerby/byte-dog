@@ -242,9 +242,12 @@ class EscalationEngine:
 # ── Hog targeting ────────────────────────────────────────────────────────
 
 
-def select_targets(procs, protected, suspended_pids=frozenset(), n=1, self_pid=None):
+def select_targets(procs, protected, suspended_pids=frozenset(), n=1, self_pid=None,
+                   is_protected=None):
     """Rank auto-action candidates by RSS. Chromium processes qualify only
-    when classified as renderers ('ctype' == 'renderer')."""
+    when classified as renderers ('ctype' == 'renderer'). `is_protected(p)`
+    (safety.ProtectionChecker) is consulted lazily, biggest first, so only as
+    many processes are inspected as needed to fill n."""
     candidates = []
     for p in procs:
         name = (p.get('name') or '').lower()
@@ -257,7 +260,16 @@ def select_targets(procs, protected, suspended_pids=frozenset(), n=1, self_pid=N
         if (p.get('rss') or 0) <= 0:
             continue
         candidates.append(p)
-    return sorted(candidates, key=lambda p: p['rss'], reverse=True)[:n]
+    ranked = sorted(candidates, key=lambda p: p['rss'], reverse=True)
+    if is_protected is None:
+        return ranked[:n]
+    picked = []
+    for p in ranked:
+        if len(picked) >= n:
+            break
+        if not is_protected(p):
+            picked.append(p)
+    return picked
 
 
 def group_by_name(procs):

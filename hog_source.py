@@ -22,13 +22,14 @@ PANEL_MIN_RSS = 20 * 1024 * 1024
 class HogSource:
     def __init__(self, snapshot=fast_memory_snapshot, titles=collect_window_titles,
                  sessions_dir: Path = SESSIONS_DIR, projects_dir: Path = PROJECTS_DIR,
-                 notes: NoteCache | None = None):
+                 notes: NoteCache | None = None, safety=None):
         self._snapshot = snapshot
         self._titles = titles
         self._sessions_dir = sessions_dir
         self._projects_dir = projects_dir
         self.roles = RoleCache()
         self.notes = notes or NoteCache()
+        self.safety = safety      # safety.ProtectionChecker; None -> name list
         self._title_cache = {}   # sessionId -> (mtime, title, transcript)
         self.sessions = {}       # pid -> enriched session dict, from the last scan
 
@@ -36,7 +37,13 @@ class HogSource:
         """Snapshot with Chromium roles, for ranking only (no labels). Only the
         role cache is locked, so the guardian's auto-act never waits on a panel
         scan's window/session/transcript work."""
-        return self.roles.annotate(self._snapshot())
+        procs = self.roles.annotate(self._snapshot())
+        if self.safety is not None:
+            self.safety.prune(p['pid'] for p in procs)
+        return procs
+
+    def is_protected(self, p: dict) -> bool:
+        return self.safety.check(p).protected if self.safety is not None else False
 
     def _session_info(self, session: dict) -> dict:
         sid = session.get('sessionId') or ''
@@ -64,7 +71,8 @@ class HogSource:
             if s.get('note') and pid in labels:
                 labels[pid] = f"{labels[pid]} | {s['note']}"
         return build_rows(procs, protected, suspended_pids=suspended_pids,
-                          self_pid=self_pid, labels=labels, min_rss=min_rss)
+                          self_pid=self_pid, labels=labels, min_rss=min_rss,
+                          protection=self.safety.check if self.safety is not None else None)
 
     def summarise(self, pid: int) -> str:
         """AI note for the Claude session behind pid. Raises SummaryError."""

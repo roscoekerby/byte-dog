@@ -227,3 +227,15 @@ class TestConfig:
         names = cfg.protected_names()
         assert 'myapp.exe' in names
         assert 'explorer.exe' in names  # from defaults
+
+
+def test_select_targets_consults_protection_lazily():
+    procs = [{'pid': i, 'name': f'p{i}.exe', 'rss': (10 - i) * GB} for i in range(10)]
+    asked = []
+
+    def is_protected(p):
+        asked.append(p['pid'])
+        return p['pid'] == 0
+    picked = select_targets(procs, frozenset(), n=2, is_protected=is_protected)
+    assert [p['pid'] for p in picked] == [1, 2]
+    assert asked == [0, 1, 2]

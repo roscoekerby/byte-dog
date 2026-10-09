@@ -26,10 +26,11 @@ from guardian import (
     fast_memory_snapshot, select_targets, group_by_name,
     harden_self, install_autostart, uninstall_autostart, autostart_installed,
     refresh_autostart,
-    is_admin, relaunch_elevated, enable_debug_privilege, protected_reason,
+    is_admin, relaunch_elevated, enable_debug_privilege, PROTECTED_INFO,
     graceful_close_process, collect_window_titles,
 )
 from hog_source import HogSource
+from safety import ProtectionChecker
 from hog_panel import HogPanel
 
 # GPU backend: NVML via nvidia-ml-py + PDH per-process VRAM (both in-process,
@@ -520,7 +521,12 @@ class ByteDogApp:
         self.guardian = RAMGuardian()
         self.guardian_queue = queue.Queue()
         self.guardian_alert_window = None
-        self.hog_source = HogSource()
+        self.safety = ProtectionChecker(
+            user_names=lambda: {n.lower() for n in self.guardian.config.user_protected},
+            self_pid=os.getpid())
+        self.hog_source = HogSource(safety=self.safety)
+        threading.Thread(target=self._warm_protection_cache, daemon=True,
+                         name='ByteDogSafetyWarm').start()
         self.hog_panel_window = None
 
         # Initialize CPU percent to prevent blocking
@@ -1200,7 +1206,8 @@ class ByteDogApp:
         if item:
             self.process_tree.selection_set(item)
             name = self.process_tree.item(item)['text']
-            lock = '🔒 ' if self._is_protected(name) else ''
+            pid = self.process_tree.item(item)['values'][0]
+            lock = '🔒 ' if self._is_protected(name, pid) else ''
 
             menu = tk.Menu(self.root, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
             menu.add_command(label=f"{lock}Kill Process", command=self.kill_selected_process)
@@ -1230,7 +1237,7 @@ class ByteDogApp:
         tk.Label(dialog, text=f"⚠ '{name}' (PID {pid}) is a protected process",
                 bg=self.colors['bg'], fg=self.colors['error'], font=('Arial', 11, 'bold'),
                 wraplength=380, justify='left').pack(padx=16, pady=(16, 8), anchor='w')
-        tk.Label(dialog, text=protected_reason(name), bg=self.colors['bg'], fg=self.colors['fg'],
+        tk.Label(dialog, text=self._protection_text(pid, name), bg=self.colors['bg'], fg=self.colors['fg'],
                 font=('Arial', 10), wraplength=380, justify='left').pack(padx=16, pady=(0, 12), anchor='w')
         tk.Label(dialog,
                 text=f"ByteDog won't {verb.lower()} this process by default — only override "
@@ -1307,7 +1314,7 @@ class ByteDogApp:
     def suspend_pid(self, pid, name, parent=None):
         if not self._same_process(pid, name):
             return False
-        if self._is_protected(name) and not self._show_protected_override_dialog(
+        if self._is_protected(name, pid) and not self._show_protected_override_dialog(
                 name, pid, 'suspend', parent):
             return None
         if not self.process_manager.suspend_process(pid):
@@ -1338,7 +1345,7 @@ class ByteDogApp:
     def kill_pid(self, pid, name, parent=None):
         if not self._same_process(pid, name):
             return False
-        if self._is_protected(name):
+        if self._is_protected(name, pid):
             if not self._show_protected_override_dialog(name, pid, 'kill', parent):
                 return None
         elif not messagebox.askyesno("Confirm", f"Kill process '{name}' (PID: {pid})?",
@@ -1400,7 +1407,7 @@ class ByteDogApp:
         """Insert one process as a Treeview row under `parent` ('' = top
         level). Name goes to the special '#0' tree column (text=), not
         `values` — see create_process_list. Returns the new item iid."""
-        tags = ('protected',) if self._is_protected(proc['name']) else ()
+        tags = ('protected',) if self._is_protected(proc['name'], proc['pid']) else ()
         return self.process_tree.insert(parent, 'end', text=proc['name'][:30], values=(
             proc['pid'],
             f"{proc.get('cpu_percent', 0):.1f}",
@@ -1492,10 +1499,32 @@ class ByteDogApp:
         for proc in remaining:
             item_map[proc['pid']] = self._insert_process_row(proc, '')
 
-    def _is_protected(self, name) -> bool:
-        """True if `name` is on the guardian's protected/never-touch list
-        (system-critical defaults plus anything the user added)."""
-        return (name or '').lower() in self.guardian.config.protected_names()
+    def _warm_protection_cache(self):
+        """Verify every running process once in the background (~1s for ~400
+        processes), so UI-thread protection checks only ever hit the cache."""
+        try:
+            for p in fast_memory_snapshot():
+                self.safety.check(p)
+        except Exception as e:
+            print(f"Protection warm-up error: {e}")
+
+    def _verdict(self, pid, name):
+        """Verified protection (safety.ProtectionChecker): what Windows says
+        about the process, not its name."""
+        return self.safety.check({'pid': int(pid), 'name': name or ''})
+
+    def _is_protected(self, name, pid) -> bool:
+        return self._verdict(pid, name).protected
+
+    def _protection_text(self, pid, name) -> str:
+        v = self._verdict(pid, name)
+        detail = PROTECTED_INFO.get((name or '').lower())
+        lines = [f"Why: {v.reason}." if v.reason else ""]
+        if v.path:
+            lines.append(f"Image: {v.path}" + (f"  (signed by {v.signer})" if v.signer else ""))
+        if detail:
+            lines.append(detail)
+        return "\n\n".join(line for line in lines if line)
 
     def update_simple_process_display(self):
         """Update simple process display for compact view"""
@@ -2035,8 +2064,8 @@ Created with Python and psutil
         """Suspend or kill the top eligible hog. Runs on a worker thread.
         Walks down the target list on AccessDenied/vanished processes."""
         targets = select_targets(
-            procs, self.guardian.config.protected_names(),
-            suspended_pids=set(self.guardian.suspended), n=5, self_pid=os.getpid())
+            procs, frozenset(), suspended_pids=set(self.guardian.suspended), n=5,
+            self_pid=os.getpid(), is_protected=self.hog_source.is_protected)
         if not targets:
             msg = "No eligible target (all processes protected)"
             self.guardian.log_event('warn', msg)
@@ -2884,7 +2913,7 @@ Created with Python and psutil
     def _select_top_target(self):
         """Top eligible target, ranked exactly as the hog panel shows it."""
         targets = select_targets(
-            self.hog_source.procs(), self.guardian.config.protected_names(),
+            self.hog_source.procs(), frozenset(), is_protected=self.hog_source.is_protected,
             suspended_pids=set(self.guardian.suspended), self_pid=os.getpid())
         return targets[0] if targets else None
 

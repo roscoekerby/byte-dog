@@ -137,3 +137,17 @@ def test_role_cache_rereads_a_reused_pid():
     which[0] = 'second'
     assert cache.annotate([{**P(3, 'chrome.exe', 1), 'ctime': 100}])[0]['ctype'] == 'renderer'
     assert cache.annotate([{**P(3, 'chrome.exe', 1), 'ctime': 200}])[0]['ctype'] == 'browser'
+
+
+def test_build_rows_uses_verified_protection_not_names():
+    from safety import Verdict
+    procs = [P(1, 'svchost.exe', 3), P(2, 'svchost.exe', 2), P(3, 'app.exe', 1)]
+    # pid 1 is a fake svchost (not protected); pid 2 is the real one
+    verdicts = {1: Verdict(False), 2: Verdict(True, 'Microsoft-signed Windows component'),
+                3: Verdict(False)}
+    rows = {r.pid: r for r in build_rows(procs, frozenset(),
+                                         protection=lambda p: verdicts[p['pid']])}
+    assert rows[1].rank == 1 and not rows[1].protected
+    assert rows[2].rank is None and rows[2].reason == 'protected'
+    assert rows[2].why == 'Microsoft-signed Windows component'
+    assert rows[3].rank == 2
