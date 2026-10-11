@@ -128,6 +128,25 @@ existing auto-start entry to point at the exe. Windows Defender may flag a fresh
 PyInstaller exe; that is the bootloader false positive, add an exclusion for
 `dist\`.
 
+### Code signing
+
+`build.bat` signs `dist\ByteDog.exe` with `sign.ps1`, so the UAC prompt shows
+"Verified publisher: ROSCODE TECH" instead of "Publisher: Unknown". The
+certificate is an internal, self-signed code-signing certificate
+(`CN=ROSCODE TECH, O=ROSCODE TECH`, code-signing use only, RSA-3072, valid to
+2031). Its private key is non-exportable and lives in the builder's
+`CurrentUser\My` store. Its public part is trusted on this PC through
+`LocalMachine\Root` and `LocalMachine\TrustedPublisher`.
+
+- Other PCs show "Unknown" unless that public certificate is imported into
+  the same two stores (admin). For any-PC trust, buy a public code-signing
+  certificate or use Microsoft Trusted Signing.
+- No certificate on the build machine: the build still succeeds, unsigned,
+  with a warning.
+- To remove: delete the "ROSCODE TECH" certificate from `CurrentUser\My`,
+  `LocalMachine\Root` and `LocalMachine\TrustedPublisher` (certlm.msc /
+  certmgr.msc).
+
 ## Configuration
 
 Guardian settings (thresholds, mode, extra protected processes) are edited in

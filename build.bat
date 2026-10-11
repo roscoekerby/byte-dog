@@ -27,5 +27,14 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo Signing ByteDog.exe ...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0sign.ps1"
+if errorlevel 2 (
+    echo [WARN] Not signed: UAC will show "Publisher: Unknown". See README "Code signing".
+) else if errorlevel 1 (
+    echo [ERROR] Signing failed. See output above.
+    exit /b 1
+)
+
 echo.
 echo Build complete: dist\ByteDog.exe
