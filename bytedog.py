@@ -41,6 +41,16 @@ import gpu as gpu_backend
 
 GPU_AVAILABLE = gpu_backend.gpu_available()
 PROCESS_NAME_COLS = 30
+LOGICAL_CPUS = psutil.cpu_count() or 1
+
+
+def machine_cpu_percent(per_core_pct, cores: int = LOGICAL_CPUS) -> float:
+    """psutil's per-process CPU % counts per core (one busy core = 100%, so
+    up to 100 x logical cores). Task Manager shows the share of the whole
+    machine; divide by the logical core count to match it."""
+    if not per_core_pct:
+        return 0.0
+    return round(per_core_pct / cores, 1) if cores else per_core_pct
 
 # Registry paths for the Startup tab. Same subpath convention as
 # guardian.AUTOSTART_KEY_PATH; StartupApproved holds the enable/disable
@@ -229,7 +239,7 @@ class SystemMonitor:
                         pass
                     cpu_pct = 0.0
 
-                pinfo['cpu_percent'] = cpu_pct or 0.0
+                pinfo['cpu_percent'] = machine_cpu_percent(cpu_pct)
                 pinfo['memory_bytes'] = int((pinfo.get('memory_percent') or 0) / 100.0 * total)
                 pinfo['gpu_mb'] = gpu_vram.get(pid, 0.0)
 
