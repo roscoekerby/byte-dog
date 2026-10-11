@@ -92,7 +92,7 @@ class HogPanel(tk.Frame):
         frame = tk.Frame(self, bg=BG)
         frame.pack(fill='both', expand=True)
         self.tree = ttk.Treeview(frame, columns=COLUMNS, show='tree headings',
-                                 height=8 if self.compact else 25, selectmode='browse')
+                                 height=8 if self.compact else 25, selectmode='extended')
         widths = COMPACT_WIDTHS if self.compact else WIDTHS
         self.tree.heading('#0', text='Process', anchor='w')
         self.tree.column('#0', width=widths['#0'], anchor='w', stretch=False)
@@ -184,7 +184,7 @@ class HogPanel(tk.Frame):
             self._timer = None
 
     def _render(self):
-        selected = self.selected()
+        selected = [iid for iid in self.tree.selection() if iid.startswith('p:')]
         scroll = self.tree.yview()[0]
         open_groups = {iid for iid in self.tree.get_children() if self.tree.item(iid, 'open')}
         self.tree.delete(*self.tree.get_children())
@@ -199,8 +199,9 @@ class HogPanel(tk.Frame):
         else:
             for r in self.rows:
                 self._insert('', r)
-        if selected and self.tree.exists(f"p:{selected[0]}"):
-            self.tree.selection_set(f"p:{selected[0]}")
+        keep = [iid for iid in selected if self.tree.exists(iid)]
+        if keep:
+            self.tree.selection_set(keep)
         self.tree.yview_moveto(scroll)
 
     def _insert(self, parent, r):
@@ -208,23 +209,37 @@ class HogPanel(tk.Frame):
         self.tree.insert(parent, 'end', iid=f"p:{r.pid}", text=f"{lock}{r.name}",
                          values=row_values(r), tags=row_tags(r))
 
+    def selected_targets(self):
+        """[(pid, name)] for every selected process; a selected app group
+        means all of its processes. Ctrl/Shift-click selects several."""
+        names = {r.pid: r.name for r in self.rows}
+        out = []
+        for iid in self.tree.selection():
+            kids = self.tree.get_children(iid) if iid.startswith('g:') else (iid,)
+            for k in kids:
+                pid = int(k[2:])
+                if k.startswith('p:') and pid in names and (pid, names[pid]) not in out:
+                    out.append((pid, names[pid]))
+        return out
+
     def selected(self):
-        """(pid, name) of the selected process row, or None for none/group."""
-        sel = self.tree.selection()
-        if not sel or not sel[0].startswith('p:'):
-            return None
-        pid = int(sel[0][2:])
-        row = next((r for r in self.rows if r.pid == pid), None)
-        return (pid, row.name) if row else None
+        """(pid, name) when exactly one process is selected, else None."""
+        targets = self.selected_targets()
+        return targets[0] if len(targets) == 1 else None
 
     # ── actions ─────────────────────────────────────────────────────────
     def _act(self, action):
         self._mark_in_use()
-        target = self.selected()
-        if not target:
-            self.set_status("Select a single process row first (not an app group).", '#ff9800')
+        targets = self.selected_targets()
+        if not targets:
+            self.set_status("Select one or more process rows first.", '#ff9800')
             return
-        pid, name = target
+        if len(targets) > 1:
+            tools = getattr(self.app, 'tools', None)
+            if tools:
+                tools.bulk(action, targets, self.winfo_toplevel())
+            return
+        pid, name = targets[0]
         handler = {'suspend': self.app.suspend_pid, 'resume': self.app.resume_pid,
                    'kill': self.app.kill_pid}[action]
         self.set_status(f"{action.title()} {name} (PID {pid})...")
@@ -278,10 +293,18 @@ class HogPanel(tk.Frame):
 
     def _context_menu(self, event):
         iid = self.tree.identify_row(event.y)
-        if not iid.startswith('p:'):
+        if not iid:
             return
-        self.tree.selection_set(iid)
+        if iid not in self.tree.selection():
+            self.tree.selection_set(iid)
         menu = tk.Menu(self, tearoff=0, bg=BTN, fg='white')
+        count = len(self.selected_targets())
+        if count > 1:
+            for action in ('suspend', 'resume', 'kill'):
+                menu.add_command(label=f"{action.title()} {count} selected",
+                                 command=lambda a=action: self._act(a))
+            menu.post(event.x_root, event.y_root)
+            return
         menu.add_command(label="Suspend", command=lambda: self._act('suspend'))
         menu.add_command(label="Resume", command=lambda: self._act('resume'))
         menu.add_command(label="Kill", command=lambda: self._act('kill'))

@@ -64,8 +64,13 @@ before that point.
     `%APPDATA%\ByteDog\session_notes.json` until the transcript changes
 - Every suspend (automatic, Top button, hog panel, Processes tab) is tracked,
   so Resume All undoes all of them
+- **Select several at once:** Ctrl/Shift-click rows in the Processes tab or the
+  hog panel (selecting an app group selects all its processes), then Suspend /
+  Resume / Kill them together: one confirmation, protected ones listed with a
+  choice to include (override) or skip them, progress shown as it goes
 - **Process Explorer-style tools** (right-click in the Processes tab or hog
-  panel): kill process tree (protected descendants skipped), restart with the
+  panel): suspend / resume / kill a whole process tree (protected descendants
+  skipped; paused ones are tracked for Resume All), restart with the
   same command line (an admin ByteDog relaunches non-admin apps without admin
   rights), set priority, set CPU affinity, open file location, copy path /
   command line, open files and DLLs

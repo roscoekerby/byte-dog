@@ -19,6 +19,9 @@ import sysinternals
 from file_locks import files_and_dlls, who_locks
 
 BG, FG, BTN = '#1e1e1e', '#ffffff', '#2d2d2d'
+BULK_LIST_MAX = 15
+VERBS = {'suspend': ('Suspend', 'Suspended'), 'resume': ('Resume', 'Resumed'),
+         'kill': ('Kill', 'Killed')}
 DETAIL_FIELDS = (('path', 'Image'), ('cmdline', 'Command line'), ('cwd', 'Working folder'),
                  ('parent', 'Parent'), ('user', 'User'), ('started', 'Started'),
                  ('priority', 'Priority'), ('threads', 'Threads / handles'),
@@ -69,6 +72,10 @@ class ProcessTools:
         menu.add_separator()
         menu.add_command(label="Kill Process Tree",
                          command=lambda: self.kill_tree(pid, name, parent))
+        menu.add_command(label="Suspend Process Tree",
+                         command=lambda: self.suspend_tree(pid, name, parent))
+        menu.add_command(label="Resume Process Tree",
+                         command=lambda: self.resume_tree(pid, name, parent))
         menu.add_command(label="Restart", command=lambda: self.restart(pid, name, parent))
         prio = tk.Menu(menu, tearoff=0, bg=BTN, fg=FG)
         for label in proc_actions.PRIORITIES:
@@ -97,18 +104,9 @@ class ProcessTools:
                                    parent=parent):
             return
 
-        def is_protected(child_pid):
-            try:
-                child_name = psutil.Process(child_pid).name()
-            except psutil.NoSuchProcess:
-                return False
-            except psutil.Error:
-                return True     # cannot verify -> leave it alone
-            return self.app._is_protected(child_name, child_pid)
-
         self._status(f"Killing {name}'s process tree...")
         self._in_background('ByteDogKillTree',
-                            lambda: proc_actions.kill_tree(pid, is_protected),
+                            lambda: proc_actions.kill_tree(pid, self._child_is_protected),
                             lambda r, err: self._tree_killed(pid, name, r, err))
 
     def _tree_killed(self, pid, name, r, err):
@@ -119,10 +117,122 @@ class ProcessTools:
             self.app.guardian.suspended.pop(p, None)
         self.app.guardian.log_event('action', f"Killed tree of {name} (PID {pid}): "
                                               f"{len(r.killed)} killed")
-        extra = (f", {len(r.skipped)} protected skipped" if r.skipped else '') + \
-                (f", {len(r.failed)} failed (access denied)" if r.failed else '')
-        self._status(f"Killed {len(r.killed)} process(es) in {name}'s tree{extra}",
-                     ok=not r.failed)
+        self._status(f"Killed {len(r.killed)} process(es) in {name}'s tree"
+                     + _skips(r.skipped, r.failed), ok=not r.failed)
+        self.app.update_alert_hogs()
+
+    def _child_is_protected(self, child_pid):
+        try:
+            child_name = psutil.Process(child_pid).name()
+        except psutil.NoSuchProcess:
+            return False
+        except psutil.Error:
+            return True     # cannot verify -> leave it alone
+        return self.app._is_protected(child_name, child_pid)
+
+    def suspend_tree(self, pid, name, parent):
+        """Pause a process and all its descendants (protected ones skipped);
+        every paused process is tracked so Resume All undoes it."""
+        if not self._same(pid, name) or not self._allowed(pid, name, 'suspend', parent):
+            return
+        self._status(f"Pausing {name}'s process tree...")
+        self._in_background('ByteDogSuspendTree',
+                            lambda: proc_actions.suspend_tree(pid, self._child_is_protected),
+                            lambda r, err: self._tree_paused(pid, name, r, err))
+
+    def _tree_paused(self, pid, name, r, err):
+        if err:
+            self._status(f"Pausing {name}'s tree failed: {err}", ok=False)
+            return
+        for p in r.done:
+            self.app.guardian.suspended[p] = _name_of(p, name)
+        self.app.guardian.log_event('action', f"Suspended tree of {name} (PID {pid}): "
+                                              f"{len(r.done)} paused")
+        self._status(f"Paused {len(r.done)} process(es) in {name}'s tree"
+                     + _skips(r.skipped, r.failed) + ". Resume All undoes it", ok=not r.failed)
+        self.app.update_alert_hogs()
+
+    def resume_tree(self, pid, name, parent):
+        self._status(f"Resuming {name}'s process tree...")
+        self._in_background('ByteDogResumeTree', lambda: proc_actions.resume_tree(pid),
+                            lambda r, err: self._tree_resumed(pid, name, r, err))
+
+    def _tree_resumed(self, pid, name, r, err):
+        if err:
+            self._status(f"Resuming {name}'s tree failed: {err}", ok=False)
+            return
+        for p in r.done:
+            self.app.guardian.suspended.pop(p, None)
+        self.app.guardian.log_event('action', f"Resumed tree of {name} (PID {pid})")
+        self._status(f"Resumed {len(r.done)} process(es) in {name}'s tree"
+                     + _skips([], r.failed), ok=not r.failed)
+        self.app.update_alert_hogs()
+
+    # ── many processes at once ──────────────────────────────────────────
+    def bulk(self, action, targets, parent):
+        """Suspend / resume / kill several selected processes: one decision
+        about protected ones, one confirmation, then a worker with progress."""
+        verb, _ = VERBS[action]
+        targets = list(dict.fromkeys(targets))
+        live = [(p, n) for p, n in targets if self.app._same_process(p, n)]
+        gone = len(targets) - len(live)
+        if action != 'resume':
+            prot = [(p, n) for p, n in live if self.app._is_protected(n, p)]
+            if prot:
+                choice = messagebox.askyesnocancel(
+                    f"{verb} {len(live)} processes",
+                    f"{len(prot)} of the {len(live)} selected are protected:\n\n"
+                    + _listing(prot) + "\n\nYes: include them anyway (override)\n"
+                    "No: skip them\nCancel: do nothing", icon='warning', parent=parent)
+                if choice is None:
+                    return
+                if choice is False:
+                    live = [t for t in live if t not in prot]
+        if not live:
+            self._status(f"Nothing to {action}" + (f" ({gone} already gone)" if gone else ''))
+            return
+        if action == 'kill' and not messagebox.askyesno(
+                f"Kill {len(live)} processes", f"Kill these {len(live)} processes?\n\n"
+                + _listing(live) + "\n\nUnsaved work in them will be lost.", parent=parent):
+            return
+        self._status(f"{verb}ing {len(live)} processes...")
+        self._in_background(f'ByteDogBulk{verb}', lambda: self._bulk_work(action, live),
+                            lambda r, err: self._bulk_done(action, r, err, gone))
+
+    def _bulk_work(self, action, targets):
+        """Worker thread. Returns (ok, failed) lists of (pid, name)."""
+        ok, failed = [], []
+        pm, suspended = self.app.process_manager, self.app.guardian.suspended
+        for i, (pid, name) in enumerate(targets, 1):
+            self._post(lambda i=i, n=name: self._status(
+                f"{VERBS[action][0]} {i}/{len(targets)}: {n}"))
+            if action == 'suspend':
+                success = pm.suspend_process(pid)
+                if success:
+                    suspended[pid] = name
+            elif action == 'resume':
+                success = pm.resume_process(pid)
+                if success or not psutil.pid_exists(pid):
+                    suspended.pop(pid, None)
+            else:
+                success = pm.kill_process(pid)
+                if success:
+                    suspended.pop(pid, None)
+            (ok if success else failed).append((pid, name))
+        return ok, failed
+
+    def _bulk_done(self, action, result, err, gone):
+        verb, done_verb = VERBS[action]
+        if err:
+            self._status(f"{verb} failed: {err}", ok=False)
+            return
+        ok, failed = result
+        self.app.guardian.log_event('action', f"Bulk {action}: {len(ok)} done, "
+                                              f"{len(failed)} failed")
+        extra = (f", {len(failed)} failed (access denied)" if failed else '') + \
+                (f", {gone} already gone" if gone else '')
+        self._status(f"{done_verb} {len(ok)} process(es){extra}", ok=not failed)
+        self.app.update_alert_hogs()
 
     def restart(self, pid, name, parent):
         if not self._same(pid, name):
@@ -313,6 +423,25 @@ class ProcessTools:
 
         tk.Button(win, text="Kill selected (safeguarded)", bg='#5a1a1a', fg=FG,
                   command=kill_selected).pack(pady=8)
+
+
+def _name_of(pid, fallback):
+    try:
+        return psutil.Process(pid).name()
+    except psutil.Error:
+        return fallback
+
+
+def _skips(skipped, failed) -> str:
+    return (f", {len(skipped)} protected skipped" if skipped else '') + \
+           (f", {len(failed)} failed (access denied)" if failed else '')
+
+
+def _listing(targets) -> str:
+    lines = [f"  {n} (PID {p})" for p, n in targets[:BULK_LIST_MAX]]
+    if len(targets) > BULK_LIST_MAX:
+        lines.append(f"  ...and {len(targets) - BULK_LIST_MAX} more")
+    return "\n".join(lines)
 
 
 class DetailsPane(tk.Frame):

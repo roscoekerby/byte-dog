@@ -100,7 +100,7 @@ def test_group_mode_nests_processes_under_apps(panel):
 def test_actions_route_to_app_and_need_a_process_row(panel):
     p, app = panel
     p._act('suspend')
-    assert app.calls == [] and 'Select a single process' in p.status.cget('text')
+    assert app.calls == [] and 'Select one or more' in p.status.cget('text')
     p.tree.selection_set('p:2')
     p._act('suspend')
     assert app.calls == [('suspend', 2)]
@@ -182,3 +182,20 @@ def test_render_keeps_scroll_position(dog):
         assert abs(p.tree.yview()[0] - before) < 0.02 and before > 0.3
     finally:
         win.destroy()
+
+
+def test_multi_select_and_group_selection_go_to_bulk(panel):
+    p, app = panel
+    bulk = []
+    app.tools = type('T', (), {'bulk': lambda self, a, t, parent: bulk.append((a, t))})()
+    p.tree.selection_set(('p:2', 'p:4'))
+    p._act('suspend')
+    assert bulk == [('suspend', [(2, 'chrome.exe'), (4, 'llama-server.exe')])] or \
+        bulk == [('suspend', [(4, 'llama-server.exe'), (2, 'chrome.exe')])]
+    p.group_var.set(True)
+    p._render()
+    p.tree.selection_set('g:chrome.exe')
+    assert p.selected_targets() == [(2, 'chrome.exe'), (3, 'chrome.exe')]
+    assert p.selected() is None          # several -> no single target
+    p.tree.selection_set('p:4')
+    assert p.selected() == (4, 'llama-server.exe')

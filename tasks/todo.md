@@ -624,3 +624,25 @@ guarded is now closed directly).
 a Toplevel); details() reported explorer.exe as exited because its parent is gone.
 
 **Tests:** 166 pass.
+
+# 2026-10-11: Multi-select + Suspend/Resume Tree
+
+- [x] `proc_actions.suspend_tree` / `resume_tree` (root first when pausing so it can't spawn
+      new children mid-walk; protected descendants skipped; every pause tracked for Resume All)
+- [x] Right-click: Suspend Process Tree / Resume Process Tree (Processes tab + hog panel)
+- [x] Multi-select (Ctrl/Shift) in the Processes tab and hog panel; a selected app group
+      means all its processes
+- [x] One `bulk_action` for suspend / resume / kill on many: one confirmation, protected ones
+      listed with a choice (include / skip / cancel), PID identity re-checked per process,
+      runs on a worker with progress, summary at the end
+- [x] Tests first; live check on throwaway process trees
+
+## Review
+
+Suspend/Resume Tree pause the root first (so it cannot spawn children mid-walk) and skip
+protected descendants; verified that the conhost.exe Windows attaches is skipped as a
+protected Windows component. Multi-select works in both lists, and an app group selection
+means all its processes. Bulk actions use one protected-process decision
+(include / skip / cancel), one kill confirmation, a per-process PID identity re-check and a
+worker with progress. Live: two processes selected in the Guardian tab, paused together
+(tracked, shown as suspended) and resumed together. 176 tests pass.

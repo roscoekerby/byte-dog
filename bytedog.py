@@ -1217,7 +1217,16 @@ class ByteDogApp:
         """Show context menu for process"""
         item = self.process_tree.identify('item', event.x, event.y)
         if item:
-            self.process_tree.selection_set(item)
+            if item not in self.process_tree.selection():
+                self.process_tree.selection_set(item)
+            count = len(self.process_tree.selection())
+            if count > 1:
+                menu = tk.Menu(self.root, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
+                for action in ('suspend', 'resume', 'kill'):
+                    menu.add_command(label=f"{action.title()} {count} selected",
+                                     command=lambda a=action: self._act_on_selection(a))
+                menu.post(event.x_root, event.y_root)
+                return
             name = self.process_tree.item(item)['text']
             pid = self.process_tree.item(item)['values'][0]
             lock = '🔒 ' if self._is_protected(name, pid) else ''
@@ -1306,20 +1315,34 @@ class ByteDogApp:
                                      foreground=self.colors['error'])
         self.refresh_processes()
 
+    def _selected_processes(self):
+        """[(pid, name)] for every selected row (Ctrl/Shift-click for several)."""
+        if not hasattr(self, 'process_tree'):
+            return []
+        out = []
+        for iid in self.process_tree.selection():
+            item = self.process_tree.item(iid)
+            if item['values']:
+                out.append((int(item['values'][0]), item['text']))
+        return out
+
+    def _act_on_selection(self, action):
+        targets = self._selected_processes()
+        if len(targets) > 1:
+            self.tools.bulk(action, targets, self.root)
+        elif targets:
+            handler = {'kill': self.kill_pid, 'suspend': self.suspend_pid,
+                       'resume': self.resume_pid}[action]
+            self._report_process_action(action, targets[0][0], handler(*targets[0]))
+
     def kill_selected_process(self):
-        sel = self._selected_process()
-        if sel:
-            self._report_process_action('kill', sel[0], self.kill_pid(*sel))
+        self._act_on_selection('kill')
 
     def suspend_selected_process(self):
-        sel = self._selected_process()
-        if sel:
-            self._report_process_action('suspend', sel[0], self.suspend_pid(*sel))
+        self._act_on_selection('suspend')
 
     def resume_selected_process(self):
-        sel = self._selected_process()
-        if sel:
-            self._report_process_action('resume', sel[0], self.resume_pid(*sel))
+        self._act_on_selection('resume')
 
     # ── Per-process actions shared by the Processes tab and the hog panel.
     # Return True/False for success, None when the user cancelled. Every

@@ -190,3 +190,37 @@ def test_plan_uses_exact_image_path():
     from proc_actions import plan_restart
     plan = plan_restart(os.getpid())
     assert Path(plan.exe) == Path(psutil.Process().exe())
+
+
+def _status(pid):
+    try:
+        return psutil.Process(pid).status()
+    except psutil.Error:
+        return None
+
+
+def test_suspend_and_resume_tree(tree):
+    from proc_actions import resume_tree, suspend_tree
+    pids = [k.pid for k in _python_kids(tree.pid)] + [tree.pid]
+    r = suspend_tree(tree.pid, is_protected=lambda pid: False)
+    assert set(pids) <= set(r.done) and not r.failed
+    assert all(_status(p) == psutil.STATUS_STOPPED for p in pids)
+    r2 = resume_tree(tree.pid)
+    assert set(pids) <= set(r2.done)
+    assert all(_status(p) != psutil.STATUS_STOPPED for p in pids)
+
+
+def test_suspend_tree_pauses_root_first_and_skips_protected(tree):
+    from proc_actions import resume_tree, suspend_tree
+    order = []
+    guarded = next(k.pid for k in _python_kids(tree.pid) if k.ppid() != tree.pid)
+
+    def is_protected(pid):
+        order.append(pid)
+        return pid == guarded
+    r = suspend_tree(tree.pid, is_protected)
+    try:
+        assert r.done[0] == tree.pid
+        assert r.skipped == [guarded] and _status(guarded) != psutil.STATUS_STOPPED
+    finally:
+        resume_tree(tree.pid)

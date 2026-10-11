@@ -68,6 +68,46 @@ def kill_tree(pid: int, is_protected: Callable[[int], bool]) -> TreeResult:
     return result
 
 
+@dataclass
+class TreeOp:
+    done: list = field(default_factory=list)
+    skipped: list = field(default_factory=list)    # protected descendants left alone
+    failed: list = field(default_factory=list)
+
+
+def suspend_tree(pid: int, is_protected: Callable[[int], bool]) -> TreeOp:
+    """Pause pid and its descendants. The root is paused first so it cannot
+    spawn new children while the tree is walked; protected descendants are
+    skipped (the caller decides about the root)."""
+    result = TreeOp()
+    for p in reversed(tree_pids(pid)):
+        if p != pid and is_protected(p):
+            result.skipped.append(p)
+            continue
+        try:
+            psutil.Process(p).suspend()
+            result.done.append(p)
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.Error:
+            result.failed.append(p)
+    return result
+
+
+def resume_tree(pid: int) -> TreeOp:
+    """Resume pid and its descendants (children first, root last)."""
+    result = TreeOp()
+    for p in tree_pids(pid):
+        try:
+            psutil.Process(p).resume()
+            result.done.append(p)
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.Error:
+            result.failed.append(p)
+    return result
+
+
 def set_priority(pid: int, label: str) -> None:
     if label not in PRIORITIES:
         raise ValueError(f"unknown priority {label!r}; choose one of {list(PRIORITIES)}")
