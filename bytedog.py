@@ -30,6 +30,7 @@ from guardian import (
     graceful_close_process, collect_window_titles,
 )
 from hog_source import HogSource
+from hog_model import top_apps
 from safety import ProtectionChecker
 from process_tools_ui import DetailsPane, ProcessTools
 from guardian_toast import build_toast
@@ -41,6 +42,7 @@ import gpu as gpu_backend
 
 GPU_AVAILABLE = gpu_backend.gpu_available()
 PROCESS_NAME_COLS = 30
+COMPACT_TOP_APPS = 6
 LOGICAL_CPUS = psutil.cpu_count() or 1
 
 
@@ -778,8 +780,8 @@ class ByteDogApp:
         top_frame = ttk.Frame(self.compact_frame)
         top_frame.pack(fill='both', expand=True, pady=10)
 
-        tk.Label(top_frame, text="Top Processes", bg=self.colors['bg'], fg=self.colors['fg'],
-                 font=('Arial', 12, 'bold')).pack(anchor='w', pady=5)
+        tk.Label(top_frame, text="Using the most memory", bg=self.colors['bg'],
+                 fg=self.colors['fg'], font=('Arial', 12, 'bold')).pack(anchor='w', pady=5)
 
         # Simple process list for compact view
         self.create_simple_process_list(top_frame)
@@ -980,9 +982,10 @@ class ByteDogApp:
         """Create simple process list for compact view"""
         # Simple text display for top processes
         self.process_display = tk.Text(parent, height=8, bg=self.colors['button'],
-                                       fg=self.colors['fg'], font=('Consolas', 8),
-                                       state='disabled')
+                                       fg=self.colors['fg'], font=('Consolas', 9),
+                                       state='disabled', cursor='hand2', relief='flat')
         self.process_display.pack(fill='both', expand=True)
+        self.process_display.bind('<Button-1>', lambda e: self.open_guardian_tab())
 
     def create_process_list(self, parent):
         """Create detailed process list view"""
@@ -1587,33 +1590,33 @@ class ByteDogApp:
         return "\n\n".join(line for line in lines if line)
 
     def update_simple_process_display(self):
-        """Update simple process display for compact view"""
+        """Compact view: the apps using the most RAM right now (all processes of
+        an app summed), from the ~5ms kernel snapshot, so it is live on every
+        tick. Click it to manage them in the Guardian tab."""
         if not hasattr(self, 'process_display'):
             return
-
-        processes = self.monitor.get_process_list(use_cache=True)
-
+        try:
+            apps = top_apps(fast_memory_snapshot(), n=COMPACT_TOP_APPS)
+        except Exception as e:
+            apps, err = [], e
+        else:
+            err = None
+        lines = []
+        for a in apps:
+            gb = a.rss / (1024 ** 3)
+            size = f"{gb:5.1f} GB" if gb >= 1 else f"{a.rss / (1024 ** 2):5.0f} MB"
+            count = f" x{a.count}" if a.count > 1 else ""
+            label = f"{a.name[:22]}{count}"
+            lines.append(f" {label:<27}{size}")
+        if err:
+            lines = [f" Snapshot unavailable: {err}"]
+        lines.append("")
+        lines.append(" Click to manage in the Guardian tab")
         self.process_display.config(state='normal')
         self.process_display.delete(1.0, tk.END)
-
-        has_memory = any(p.get('memory_percent', 0) > 0 for p in processes)
-
-        if not processes:
-            self.process_display.insert(1.0, "  Click Refresh to scan processes")
-        elif not has_memory:
-            self.process_display.insert(1.0, "TOP PROCESSES (click Refresh for memory)\n")
-            self.process_display.insert(tk.END, "-" * 30 + "\n")
-            for proc in processes[:8]:
-                name = proc['name'][:28]
-                self.process_display.insert(tk.END, f"  {name}\n")
-        else:
-            self.process_display.insert(1.0, "TOP PROCESSES (by Memory)\n")
-            self.process_display.insert(tk.END, "-" * 30 + "\n")
-            for proc in processes[:8]:
-                name = proc['name'][:15]
-                mem_pct = proc.get('memory_percent', 0)
-                self.process_display.insert(tk.END, f"{name:<15} {mem_pct:>6.1f}%\n")
-
+        self.process_display.insert(1.0, "\n".join(lines))
+        self.process_display.tag_add('hint', 'end-2l', 'end')
+        self.process_display.tag_config('hint', foreground='#888888')
         self.process_display.config(state='disabled')
 
     def update_metrics(self):

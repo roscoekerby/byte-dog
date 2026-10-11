@@ -70,3 +70,24 @@ def test_notice_ram_bar_is_drawn(dog, inline):
         assert x1 == int((380 - 24) * 0.8)
     finally:
         dog.guardian_alert_window.destroy()
+
+
+def test_compact_list_shows_real_apps_with_sizes(dog):
+    dog.set_view_mode('compact')
+    dog.update_simple_process_display()
+    text = dog.process_display.get('1.0', 'end')
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    assert lines[-1].strip() == 'Click to manage in the Guardian tab'
+    rows = lines[:-1]
+    assert 1 <= len(rows) <= 6
+    assert all(r.rstrip().endswith(('GB', 'MB')) for r in rows)
+    assert not any(r.strip().startswith(('System Idle Process', 'System ', 'Registry'))
+                   for r in rows)
+
+
+def test_clicking_compact_list_opens_guardian(dog):
+    dog.set_view_mode('compact')
+    dog.process_display.event_generate('<Button-1>', x=5, y=5)
+    dog.root.update()
+    assert dog._active_detailed_tab_text() == 'Guardian'
+    dog.set_view_mode('compact')

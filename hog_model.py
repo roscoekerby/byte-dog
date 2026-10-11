@@ -151,3 +151,29 @@ class RoleCache:
                 out.append({**p, 'ctype': ctype})
             return out
 
+
+
+# Kernel placeholders you can't act on and that only clutter a short list.
+# vmmem/vmmemWSL stay visible: that is the WSL/Docker VM, often the biggest hog.
+HIDDEN_FROM_TOP = frozenset({'system idle process', 'idle', 'system', 'registry',
+                             'secure system', 'memory compression', 'memcompression'})
+
+
+@dataclass(frozen=True)
+class AppTotal:
+    name: str
+    rss: int
+    count: int
+
+
+def top_apps(procs: list, n: int = 6) -> list:
+    """Biggest apps by total RSS (all processes of one name summed)."""
+    totals = {}
+    for p in procs:
+        name = p.get('name') or '?'
+        if name.lower() in HIDDEN_FROM_TOP:
+            continue
+        rss, count = totals.get(name, (0, 0))
+        totals[name] = (rss + (p.get('rss') or 0), count + 1)
+    ranked = sorted(totals.items(), key=lambda kv: -kv[1][0])[:n]
+    return [AppTotal(name, rss, count) for name, (rss, count) in ranked]

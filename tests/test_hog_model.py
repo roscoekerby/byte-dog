@@ -151,3 +151,14 @@ def test_build_rows_uses_verified_protection_not_names():
     assert rows[2].rank is None and rows[2].reason == 'protected'
     assert rows[2].why == 'Microsoft-signed Windows component'
     assert rows[3].rank == 2
+
+
+def test_top_apps_groups_and_drops_kernel_placeholders():
+    from hog_model import top_apps
+    procs = [P(1, 'System Idle Process', 0.0), P(4, 'System', 0.1), P(5, 'Registry', 0.2),
+             P(6, 'Memory Compression', 12), P(7, 'vmmemWSL', 10),
+             P(10, 'chrome.exe', 0.5), P(11, 'chrome.exe', 0.7), P(12, 'Code.exe', 0.9)]
+    apps = top_apps(procs, n=3)
+    assert [(a.name, a.count) for a in apps] == [('vmmemWSL', 1), ('chrome.exe', 2),
+                                                  ('Code.exe', 1)]
+    assert apps[1].rss == int(1.2 * GB) or abs(apps[1].rss - 1.2 * GB) < 2
