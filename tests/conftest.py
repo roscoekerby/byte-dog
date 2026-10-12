@@ -5,6 +5,7 @@ Tk() in the same run intermittently fails to read init.tcl, and once that
 happens every later Tk() fails too ("invalid command name tcl_findLibrary").
 """
 import sys
+import tempfile
 import tkinter as tk
 from pathlib import Path
 
@@ -17,6 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 def dog():
     """The one ByteDogApp (and Tk root) for the whole test session."""
     import bytedog
+    import ui_prefs
+    # For the whole session: the user's saved theme must not leak into tests,
+    # and toggles flipped by tests must not be saved over it.
+    real_prefs = ui_prefs.PREFS_PATH
+    ui_prefs.PREFS_PATH = Path(tempfile.mkdtemp(prefix='bytedog-ui-')) / 'ui.json'
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(bytedog.ByteDogApp, 'start_monitoring', lambda self: None)
         mp.setattr(bytedog.ByteDogApp, 'process_queue', lambda self: None)
@@ -26,6 +32,7 @@ def dog():
         application.root.destroy()
     except tk.TclError:
         pass
+    ui_prefs.PREFS_PATH = real_prefs
 
 
 class InlineThread:

@@ -15,6 +15,19 @@ before that point.
 - Minimal / compact / detailed views (NetDog-style toggling), always-on-top overlay
 - Real-time CPU, RAM, GPU monitoring with history graphs (GPU shown in the
   minimal overlay too)
+- **Light and dark themes:** View > Theme offers Match Windows (default, follows
+  the Windows app mode while running), Light or Dark. Switching re-colours the
+  open window instantly, title bar included. View > See-through window makes it
+  translucent. Both choices are saved in `%APPDATA%\ByteDog\ui.json`
+- **Overview tab:** system, processor (its real model name), memory and GPU
+  cards, plus one bar per logical core coloured by load
+- **Performance tab:** CPU, memory and GPU line charts with current value,
+  average and peak
+- **Network tab:** live download/upload speed, totals since boot, a 60-second
+  throughput chart, and an adapters table (status, IPv4, link speed, live
+  speed, totals). Connected adapters are listed first; disconnected,
+  self-assigned (169.254.x) and loopback adapters are hidden behind
+  "Show disconnected (N)"
 - **GPU via NVML (nvidia-ml-py):** load, VRAM, temperature, all in-process
   (no nvidia-smi subprocess, no console flashes under pythonw)
 - **Per-process VRAM column** in the process list; sourced from Windows GPU
@@ -152,6 +165,10 @@ certificate is an internal, self-signed code-signing certificate
 Guardian settings (thresholds, mode, extra protected processes) are edited in
 the Guardian tab of the detailed view and persisted to
 `%APPDATA%\ByteDog\config.json`.
+
+Display choices (theme, see-through window) are saved separately in
+`%APPDATA%\ByteDog\ui.json`; a missing or broken file falls back to Match
+Windows with a solid window.
 
 ## Testing
 

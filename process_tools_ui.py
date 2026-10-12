@@ -17,8 +17,7 @@ import psutil
 import proc_actions
 import sysinternals
 from file_locks import files_and_dlls, who_locks
-
-BG, FG, BTN = '#1e1e1e', '#ffffff', '#2d2d2d'
+from ui_theme import COLORS as C, font, mono
 BULK_LIST_MAX = 15
 VERBS = {'suspend': ('Suspend', 'Suspended'), 'resume': ('Resume', 'Resumed'),
          'kill': ('Kill', 'Killed')}
@@ -77,7 +76,7 @@ class ProcessTools:
         menu.add_command(label="Resume Process Tree",
                          command=lambda: self.resume_tree(pid, name, parent))
         menu.add_command(label="Restart", command=lambda: self.restart(pid, name, parent))
-        prio = tk.Menu(menu, tearoff=0, bg=BTN, fg=FG)
+        prio = tk.Menu(menu, tearoff=0)
         for label in proc_actions.PRIORITIES:
             prio.add_command(label=label,
                              command=lambda lb=label: self.set_priority(pid, name, lb, parent))
@@ -278,16 +277,16 @@ class ProcessTools:
             return
         win = tk.Toplevel(parent)
         win.title(f"CPU affinity: {name} ({pid})")
-        win.configure(bg=BG)
+        win.configure(bg=C['bg'])
         win.transient(parent)
         win.attributes('-topmost', True)
         cpus = list(range(psutil.cpu_count() or 1))
         vars_ = [tk.BooleanVar(value=c in current) for c in cpus]
-        grid = tk.Frame(win, bg=BG)
+        grid = tk.Frame(win, bg=C['bg'])
         grid.pack(padx=12, pady=10)
         for c, v in zip(cpus, vars_):
-            tk.Checkbutton(grid, text=f"CPU {c}", variable=v, bg=BG, fg=FG, selectcolor=BTN,
-                           activebackground=BG).grid(row=c // 4, column=c % 4, sticky='w')
+            tk.Checkbutton(grid, text=f"CPU {c}", variable=v, bg=C['bg'], fg=C['fg'],
+                           activeforeground=C['fg']).grid(row=c // 4, column=c % 4, sticky='w')
 
         def apply():
             chosen = [c for c, v in zip(cpus, vars_) if v.get()]
@@ -300,7 +299,7 @@ class ProcessTools:
             except (psutil.Error, ValueError) as e:
                 messagebox.showerror("Affinity", str(e), parent=win)
 
-        tk.Button(win, text="Apply", bg=BTN, fg=FG, command=apply).pack(pady=(0, 10))
+        tk.Button(win, text="Apply", bg=C['accent'], fg=C['on_accent'], command=apply).pack(pady=(0, 10))
 
     def open_location(self, pid):
         d = proc_actions.details(pid)
@@ -332,13 +331,14 @@ class ProcessTools:
         self._status(f"{name}: {len(files)} open files, {len(dlls)} modules")
         win = tk.Toplevel(parent)
         win.title(f"Open files & DLLs: {name} ({pid})")
-        win.configure(bg=BG)
+        win.configure(bg=C['bg'])
         win.geometry("900x560")
         nb = ttk.Notebook(win)
         nb.pack(fill='both', expand=True, padx=8, pady=8)
         for title, items in ((f"Files ({len(files)})", files), (f"DLLs ({len(dlls)})", dlls)):
-            frame = tk.Frame(nb, bg=BG)
-            lb = tk.Listbox(frame, bg=BTN, fg=FG, font=('Consolas', 9), activestyle='none')
+            frame = tk.Frame(nb, bg=C['bg'])
+            lb = tk.Listbox(frame, bg=C['surface'], fg=C['fg'], font=mono(9), activestyle='none',
+                            selectbackground=C['select'], selectforeground=C['fg'])
             sb = ttk.Scrollbar(frame, orient='vertical', command=lb.yview)
             lb.configure(yscrollcommand=sb.set)
             sb.pack(side='right', fill='y')
@@ -392,13 +392,13 @@ class ProcessTools:
             return
         win = tk.Toplevel(parent)
         win.title("Who is locking this file?")
-        win.configure(bg=BG)
+        win.configure(bg=C['bg'])
         win.geometry("640x320")
-        tk.Label(win, text="\n".join(paths), bg=BG, fg='#aaaaaa', font=('Consolas', 8),
+        tk.Label(win, text="\n".join(paths), bg=C['bg'], fg=C['muted'], font=mono(8),
                  justify='left', anchor='w').pack(fill='x', padx=10, pady=(10, 4))
         if not holders:
-            tk.Label(win, text="No process has this file open.", bg=BG, fg='#4caf50',
-                     font=('Arial', 10)).pack(padx=10, pady=10, anchor='w')
+            tk.Label(win, text="No process has this file open.", bg=C['bg'], fg=C['success'],
+                     font=font(10)).pack(padx=10, pady=10, anchor='w')
             return
         tree = ttk.Treeview(win, columns=('pid', 'app'), show='tree headings', height=8)
         tree.heading('#0', text='Process')
@@ -421,7 +421,7 @@ class ProcessTools:
                 if ok:
                     tree.delete(sel[0])
 
-        tk.Button(win, text="Kill selected (safeguarded)", bg='#5a1a1a', fg=FG,
+        tk.Button(win, text="Kill selected (safeguarded)", bg=C['danger_bg'], fg=C['error'],
                   command=kill_selected).pack(pady=8)
 
 
@@ -449,14 +449,15 @@ class DetailsPane(tk.Frame):
     Loads on a worker thread; protection comes from the app's verified check."""
 
     def __init__(self, parent, app):
-        super().__init__(parent, bg=BG)
+        super().__init__(parent, bg=C['surface'], highlightthickness=1,
+                         highlightbackground=C['border'], padx=8, pady=6)
         self.app = app
         self._shown = None
         self.values = {}
         for row, (key, label) in enumerate(DETAIL_FIELDS):
-            tk.Label(self, text=label, bg=BG, fg='#888888', font=('Arial', 8),
+            tk.Label(self, text=label, bg=C['surface'], fg=C['muted'], font=font(8),
                      anchor='e').grid(row=row // 2, column=(row % 2) * 2, sticky='e', padx=(8, 4))
-            v = tk.Label(self, text='', bg=BG, fg=FG, font=('Consolas', 8), anchor='w',
+            v = tk.Label(self, text='', bg=C['surface'], fg=C['fg'], font=mono(8), anchor='w',
                          justify='left', wraplength=420)
             v.grid(row=row // 2, column=(row % 2) * 2 + 1, sticky='w')
             self.values[key] = v
@@ -492,4 +493,4 @@ class DetailsPane(tk.Frame):
                  'protection': verdict.reason or 'not protected'}
         for key, label in self.values.items():
             label.config(text=str(shown.get(key, '') or ''))
-        self.values['protection'].config(fg='#ff9800' if verdict.protected else '#4caf50')
+        self.values['protection'].config(fg=C['warning'] if verdict.protected else C['success'])

@@ -12,14 +12,13 @@ from tkinter import ttk
 
 from hog_model import group_rows
 from session_notes import SUMMARY_MODEL, SummaryError
+from ui_theme import COLORS as C, font
 
 REFRESH_MS = 5000
 COLUMNS = ('rank', 'mem', 'state', 'what')
 HEADINGS = {'rank': '#', 'mem': 'Memory', 'state': 'State', 'what': 'What it is'}
 WIDTHS = {'#0': 170, 'rank': 40, 'mem': 80, 'state': 95, 'what': 520}
 COMPACT_WIDTHS = {'#0': 140, 'rank': 30, 'mem': 70, 'state': 80, 'what': 260}
-BG = '#1a1a1a'
-BTN = '#2d2d2d'
 
 
 def fmt_mem(rss: int) -> str:
@@ -44,52 +43,51 @@ def row_tags(r) -> tuple:
 
 class HogPanel(tk.Frame):
     def __init__(self, parent, app, compact: bool = False):
-        super().__init__(parent, bg=BG)
+        super().__init__(parent, bg=C['bg'])
         self.app = app
         self.compact = compact
         self.rows = []
         self._busy = False
         self._pending = False
         self._timer = None
-        self._last_action = ('', '#aaaaaa')
+        self._last_action = ('', 'muted')
         self.group_var = tk.BooleanVar(value=False)
         self._build_toolbar()
         self._build_tree()
-        self.status = tk.Label(self, text="", bg=BG, fg='#aaaaaa', font=('Arial', 8),
+        self.status = tk.Label(self, text="", bg=C['bg'], fg=C['muted'], font=font(9),
                                anchor='w', justify='left')
         self.status.pack(fill='x', pady=(2, 0))
         self.bind('<Destroy>', self._on_destroy)
         self._schedule(50)
 
     # ── layout ──────────────────────────────────────────────────────────
-    def _button(self, bar, text, cmd, color=BTN):
-        b = tk.Button(bar, text=text, bg=color, fg='white', relief='flat',
-                      font=('Arial', 8), command=cmd)
+    def _button(self, bar, text, cmd, color='button', fg='fg'):
+        b = tk.Button(bar, text=text, bg=C[color], fg=C[fg], font=font(9), command=cmd)
         b.pack(side='left', padx=(0, 4))
         return b
 
     def _build_toolbar(self):
-        bar = tk.Frame(self, bg=BG)
+        bar = tk.Frame(self, bg=C['bg'])
         bar.pack(fill='x', pady=(0, 4))
         # right-hand buttons packed first so a narrow alert squeezes the
         # checkbox, not the Full view button
         tk.Button(bar, text="Full view" if self.compact else "Maximise",
-                  bg=BTN, fg='white', relief='flat', font=('Arial', 8),
+                  bg=C['button'], fg=C['fg'], font=font(9),
                   command=self.app.open_hog_panel if self.compact else self._toggle_max
                   ).pack(side='right')
-        tk.Button(bar, text="Refresh", bg=BTN, fg='white', relief='flat', font=('Arial', 8),
+        tk.Button(bar, text="Refresh", bg=C['button'], fg=C['fg'], font=font(9),
                   command=lambda: self.refresh(force=True)).pack(side='right', padx=(0, 4))
         self._button(bar, "Suspend", lambda: self._act('suspend'))
         self._button(bar, "Resume", lambda: self._act('resume'))
-        self._button(bar, "Kill", lambda: self._act('kill'), '#5a1a1a')
-        self.note_btn = self._button(bar, "AI note", self._summarise, '#1a3a5a')
+        self._button(bar, "Kill", lambda: self._act('kill'), 'danger_bg', 'error')
+        self.note_btn = self._button(bar, "AI note", self._summarise, 'info_bg', 'accent')
         tk.Checkbutton(bar, text="Group by app", variable=self.group_var,
-                       command=lambda: (self._mark_in_use(), self._render()), bg=BG, fg='white', selectcolor=BTN,
-                       activebackground=BG, activeforeground='white',
-                       font=('Arial', 8)).pack(side='left', padx=(6, 0))
+                       command=lambda: (self._mark_in_use(), self._render()),
+                       bg=C['bg'], fg=C['fg'], activeforeground=C['fg'],
+                       font=font(9)).pack(side='left', padx=(6, 0))
 
     def _build_tree(self):
-        frame = tk.Frame(self, bg=BG)
+        frame = tk.Frame(self, bg=C['bg'])
         frame.pack(fill='both', expand=True)
         self.tree = ttk.Treeview(frame, columns=COLUMNS, show='tree headings',
                                  height=8 if self.compact else 25, selectmode='extended')
@@ -99,10 +97,10 @@ class HogPanel(tk.Frame):
         for col in COLUMNS:
             self.tree.heading(col, text=HEADINGS[col], anchor='w')
             self.tree.column(col, width=widths[col], anchor='w', stretch=(col == 'what'))
-        self.tree.tag_configure('next', background='#5a2a00')
-        self.tree.tag_configure('suspended', foreground='#64b5f6')
-        self.tree.tag_configure('protected', foreground='#888888')
-        self.tree.tag_configure('group', font=('Arial', 9, 'bold'))
+        self.tree.tag_configure('next', background=C['warn_bg'])
+        self.tree.tag_configure('suspended', foreground=C['accent'])
+        self.tree.tag_configure('protected', foreground=C['faint'])
+        self.tree.tag_configure('group', font=font(9, 'bold'))
         ys = ttk.Scrollbar(frame, orient='vertical', command=self.tree.yview)
         xs = ttk.Scrollbar(frame, orient='horizontal', command=self.tree.xview)
         self.tree.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
@@ -117,9 +115,10 @@ class HogPanel(tk.Frame):
         top.state('normal' if top.state() == 'zoomed' else 'zoomed')
 
     # ── data ────────────────────────────────────────────────────────────
-    def set_status(self, text, color='#aaaaaa'):
+    def set_status(self, text, color='muted'):
+        """color is a theme key (muted, success, warning, error)."""
         if self.winfo_exists():
-            self.status.config(text=text, fg=color)
+            self.status.config(text=text, fg=C[color])
 
     def _schedule(self, delay=REFRESH_MS):
         if self._timer:
@@ -169,7 +168,7 @@ class HogPanel(tk.Frame):
 
     def _failed(self, err):
         self._busy = False
-        self.set_status(f"Scan failed: {err}", '#f44336')
+        self.set_status(f"Scan failed: {err}", 'error')
         if self.winfo_exists():
             self._schedule()
 
@@ -232,7 +231,7 @@ class HogPanel(tk.Frame):
         self._mark_in_use()
         targets = self.selected_targets()
         if not targets:
-            self.set_status("Select one or more process rows first.", '#ff9800')
+            self.set_status("Select one or more process rows first.", 'warning')
             return
         if len(targets) > 1:
             tools = getattr(self.app, 'tools', None)
@@ -250,7 +249,7 @@ class HogPanel(tk.Frame):
         done = {'suspend': 'Suspended', 'resume': 'Resumed', 'kill': 'Killed'}[action]
         self._last_action = (f"{done} {name} (PID {pid})." if ok
                              else f"Could not {action} {name} (PID {pid}): access denied or gone.",
-                             '#4caf50' if ok else '#f44336')
+                             'success' if ok else 'error')
         self.set_status(*self._last_action)
         self.refresh(force=True)
 
@@ -258,12 +257,12 @@ class HogPanel(tk.Frame):
         self._mark_in_use()
         if str(self.note_btn.cget('state')) == 'disabled':
             self.set_status("An AI note is already being generated; wait for it to finish.",
-                            '#ff9800')
+                            'warning')
             return
         target = self.selected()
         if not target or target[1].lower() != 'claude.exe':
             self.set_status("AI note works on claude.exe rows: select a Claude session.",
-                            '#ff9800')
+                            'warning')
             return
         pid, _ = target
         self.note_btn.config(state='disabled')
@@ -285,8 +284,8 @@ class HogPanel(tk.Frame):
         if not self.winfo_exists():
             return
         self.note_btn.config(state='normal')
-        self._last_action = ((f"AI note failed for PID {pid}: {err}", '#f44336') if err
-                             else (f"AI note for PID {pid}: {note}", '#4caf50'))
+        self._last_action = ((f"AI note failed for PID {pid}: {err}", 'error') if err
+                             else (f"AI note for PID {pid}: {note}", 'success'))
         self.set_status(*self._last_action)
         if not err:
             self.refresh(force=True)
@@ -297,7 +296,7 @@ class HogPanel(tk.Frame):
             return
         if iid not in self.tree.selection():
             self.tree.selection_set(iid)
-        menu = tk.Menu(self, tearoff=0, bg=BTN, fg='white')
+        menu = tk.Menu(self, tearoff=0)
         count = len(self.selected_targets())
         if count > 1:
             for action in ('suspend', 'resume', 'kill'):

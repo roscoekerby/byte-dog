@@ -646,3 +646,63 @@ means all its processes. Bulk actions use one protected-process decision
 (include / skip / cancel), one kill confirmation, a per-process PID identity re-check and a
 worker with progress. Live: two processes selected in the Guardian tab, paused together
 (tracked, shown as suspended) and resumed together. 176 tests pass.
+
+# Design pass: Network tab first, then a consistent look across the app (2026-10-12)
+
+Why: the Network tab is a centred monospace text dump. It lists 9 adapters, but only
+Wi-Fi is connected; the other 8 are dead 169.254.x adapters. It shows lifetime byte
+totals instead of live speed. Other tabs share the problem: ASCII graphs on Performance,
+"Core 0: 0%" text on Overview, and mixed fonts and button styles everywhere.
+No new dependencies: Tk Canvas only.
+
+Decided: all 5 phases; light AND dark palettes. View > Theme offers System (follows the
+Windows app setting, default), Light, Dark; saved in %APPDATA%\ByteDog\ui.json with the
+See-through choice. Switching re-colours live (no restart).
+
+## Phase 1: shared look (`ui_theme.py`)
+- [x] One palette (background, surface, raised, border, text, muted, accent, ok/warn/danger)
+      and one font set (Segoe UI for text, Cascadia Mono/Consolas only for numbers)
+- [x] Helpers: `card(parent, title)`, `stat(parent, label)`, `section(parent, title)`,
+      `Sparkline` canvas (line plus fill, grid, current value)
+- [x] ttk styles: notebook tabs, Treeview rows/headings, buttons in three roles
+      (Primary / Neutral / Danger), scrollbars
+
+## Phase 2: Network tab (`network_tab.py`)
+- [x] Top row cards: Download now, Upload now (live rate from counter deltas), Received
+      and Sent since boot
+- [x] 60-second up/down chart
+- [x] Adapters table: name, status, IPv4, link speed, sent/received; connected first,
+      disconnected hidden behind a "Show disconnected (8)" toggle
+
+## Phase 3: Performance tab
+- [x] Replace the ASCII graphs with Canvas charts for CPU, RAM and GPU, each showing its
+      current value and peak
+
+## Phase 4: Overview tab
+- [x] System info as cards; per-core usage as small bars instead of "Core N: x%" text
+
+## Phase 5: consistency pass on Processes, Guardian, Services, Startup, Users
+- [x] Same buttons, fonts and spacing; Kill stays red, everything else neutral
+
+## Testing
+- [x] Unit tests for rate maths and adapter sorting/filtering; Tk smoke tests that each tab
+      builds and refreshes; live screenshots of every tab before and after
+
+## Review
+
+The theme lives in `ui_theme.py`: two palettes with the same keys, Tk option defaults, hover
+for every button via `bind_class`, and a native title bar that follows the theme.
+Live switching swaps each old palette value for the new one across the widget tree,
+including Text and Treeview tags, Canvas items and ttk widgets with their own colours.
+Charts redraw on change. A test checks that the palettes map both ways without ambiguity.
+Network, Performance and Overview are now their own modules built from shared widgets
+(Card, Stat, LineChart, CoreBars), which took about 140 lines out of bytedog.py.
+Network sampling runs on a worker. Its pure logic (`net_model.py`) is unit-tested, and
+dead adapters (169.254.x, loopback, down) sit behind "Show disconnected (N)". Every
+hardcoded colour in the four existing UI modules is now a theme key; fonts are Segoe UI
+and Cascadia Mono. The Guardian sliders are ttk.Scale with a % readout and still save
+only on a whole-percent change. Review fixes: ttk status text recolours, the history
+span uses the real 2 s sample timer, chart listeners are released on destroy, adapter
+order is stable, there is no averaged spike after the tab was hidden, the physical core
+count may be missing, and the Text caret is themed. Verified with screenshots of all 9
+views in both themes (light captured after a live switch from dark) and 199 tests.

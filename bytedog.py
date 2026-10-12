@@ -35,6 +35,11 @@ from safety import ProtectionChecker
 from process_tools_ui import DetailsPane, ProcessTools
 from guardian_toast import build_toast
 from hog_panel import HogPanel
+import ui_prefs
+import ui_theme
+from network_tab import NetworkTab
+from overview_tab import OverviewTab
+from perf_tab import PerformanceTab
 
 # GPU backend: NVML via nvidia-ml-py + PDH per-process VRAM (both in-process,
 # no subprocess — safe under pythonw, no console flashes)
@@ -44,6 +49,9 @@ GPU_AVAILABLE = gpu_backend.gpu_available()
 PROCESS_NAME_COLS = 30
 COMPACT_TOP_APPS = 6
 SEE_THROUGH_ALPHA = 0.9
+SYSTEM_THEME_POLL_MS = 5000
+HISTORY_SAMPLE_MS = 2000      # metrics timer: one CPU/RAM/GPU history point per tick
+COMPACT_SIZE = '340x400'
 LOGICAL_CPUS = psutil.cpu_count() or 1
 
 
@@ -449,7 +457,7 @@ class MinimalView(tk.Toplevel):
         self.overrideredirect(True)
         apply_window_icon(self)
 
-        self.configure(bg='#1e1e1e')
+        self.configure(bg=ui_theme.COLORS['bg'])
 
         self.setup_ui()
         self.make_draggable()
@@ -458,29 +466,30 @@ class MinimalView(tk.Toplevel):
     def setup_ui(self):
         """Setup minimal UI"""
         # Title bar
-        title_frame = tk.Frame(self, bg='#2d2d2d', height=20)
+        c = ui_theme.COLORS
+        title_frame = tk.Frame(self, bg=c['surface'], height=22)
         title_frame.pack(fill='x')
         title_frame.pack_propagate(False)
 
-        tk.Label(title_frame, text="ByteDog 🐕", fg='#ffffff', bg='#2d2d2d',
-                 font=('Arial', 9, 'bold')).pack(side='left', padx=5)
+        tk.Label(title_frame, text="ByteDog 🐕", fg=c['fg'], bg=c['surface'],
+                 font=ui_theme.font(9, 'bold')).pack(side='left', padx=5)
 
-        close_btn = tk.Button(title_frame, text="×", fg='#ffffff', bg='#2d2d2d',
-                              font=('Arial', 12), bd=0, command=self.destroy)
+        close_btn = tk.Button(title_frame, text="×", fg=c['muted'], bg=c['surface'], padx=4, pady=0,
+                              font=ui_theme.font(12), bd=0, command=self.destroy)
         close_btn.pack(side='right', padx=5)
 
         # Metrics
-        self.cpu_label = tk.Label(self, text="CPU: 0%", fg='#00ff00', bg='#1e1e1e',
-                                  font=('Consolas', 11))
+        self.cpu_label = tk.Label(self, text="CPU: 0%", fg=c['success'], bg=c['bg'],
+                                  font=ui_theme.mono(11))
         self.cpu_label.pack(pady=5)
 
-        self.ram_label = tk.Label(self, text="RAM: 0%", fg='#00ff00', bg='#1e1e1e',
-                                  font=('Consolas', 11))
+        self.ram_label = tk.Label(self, text="RAM: 0%", fg=c['success'], bg=c['bg'],
+                                  font=ui_theme.mono(11))
         self.ram_label.pack()
 
         if GPU_AVAILABLE:
-            self.gpu_label = tk.Label(self, text="GPU: 0%", fg='#00ff00', bg='#1e1e1e',
-                                      font=('Consolas', 11))
+            self.gpu_label = tk.Label(self, text="GPU: 0%", fg=c['success'], bg=c['bg'],
+                                      font=ui_theme.mono(11))
             self.gpu_label.pack()
 
     def make_draggable(self):
@@ -505,8 +514,8 @@ class MinimalView(tk.Toplevel):
             mem = self.monitor.get_memory_info()
 
             # Color code based on usage
-            cpu_color = '#00ff00' if cpu < 50 else '#ffff00' if cpu < 80 else '#ff0000'
-            mem_color = '#00ff00' if mem['percent'] < 50 else '#ffff00' if mem['percent'] < 80 else '#ff0000'
+            cpu_color = ui_theme.level_color(cpu)
+            mem_color = ui_theme.level_color(mem['percent'])
 
             self.cpu_label.config(text=f"CPU: {cpu:.1f}%", fg=cpu_color)
             self.ram_label.config(text=f"RAM: {mem['percent']:.1f}%", fg=mem_color)
@@ -515,7 +524,7 @@ class MinimalView(tk.Toplevel):
                 gpu_info = self.monitor.get_gpu_info()
                 if gpu_info:
                     load = gpu_info['load']
-                    gpu_color = '#00ff00' if load < 50 else '#ffff00' if load < 80 else '#ff0000'
+                    gpu_color = ui_theme.level_color(load)
                     self.gpu_label.config(text=f"GPU: {load:.1f}%", fg=gpu_color)
         except:
             pass
@@ -558,17 +567,12 @@ class ByteDogApp:
         # Queue for thread communication
         self.data_queue = queue.Queue()
 
-        # Dark theme colors
-        self.colors = {
-            'bg': '#1e1e1e',
-            'fg': '#ffffff',
-            'button': '#2d2d2d',
-            'select': '#404040',
-            'accent': '#007acc',
-            'success': '#4caf50',
-            'warning': '#ff9800',
-            'error': '#f44336'
-        }
+        # Light or dark palette, shared live with every panel (ui_theme.COLORS)
+        self.prefs = ui_prefs.load()
+        self.theme_choice = tk.StringVar(master=self.root, value=self.prefs.theme)
+        ui_theme.COLORS.update(ui_theme.resolve(self.prefs.theme))
+        self.colors = ui_theme.COLORS
+        ui_theme.install(self.root)
 
         # Dragging variables
         self.drag_start_x = 0
@@ -583,8 +587,9 @@ class ByteDogApp:
     def setup_window(self):
         """Configure the main window"""
         self.root.attributes('-topmost', True)
-        self.see_through = tk.BooleanVar(master=self.root, value=False)
+        self.see_through = tk.BooleanVar(master=self.root, value=self.prefs.see_through)
         self.apply_see_through()
+        self.root.after(SYSTEM_THEME_POLL_MS, self._follow_system_theme)
 
         # Position in top-right corner
         self.root.update_idletasks()
@@ -592,7 +597,7 @@ class ByteDogApp:
         screen_height = self.root.winfo_screenheight()
         x = screen_width - 340 - 20  # Start sized for compact view (default)
         y = 50
-        self.root.geometry(f"340x345+{x}+{y}")
+        self.root.geometry(f"{COMPACT_SIZE}+{x}+{y}")
 
         # Make window draggable
         self.root.bind('<Button-1>', self.start_drag)
@@ -629,22 +634,8 @@ class ByteDogApp:
         self.root.geometry(f"+{x}+{y}")
 
     def setup_styles(self):
-        """Configure ttk styles for dark theme"""
-        style = ttk.Style()
-        style.theme_use('clam')
-
-        # Configure colors
-        style.configure('TFrame', background=self.colors['bg'])
-        style.configure('TLabel', background=self.colors['bg'], foreground=self.colors['fg'])
-        style.configure('TButton', background=self.colors['button'], foreground=self.colors['fg'])
-        style.map('TButton', background=[('active', self.colors['select'])])
-
-        # Treeview
-        style.configure('Treeview', background=self.colors['button'],
-                        foreground=self.colors['fg'], fieldbackground=self.colors['button'])
-        style.configure('Treeview.Heading', background=self.colors['select'],
-                        foreground=self.colors['fg'])
-        style.map('Treeview', background=[('selected', self.colors['accent'])])
+        """ttk styles come from the shared theme (light or dark)."""
+        ui_theme.apply_ttk(self.root)
 
     def setup_ui(self):
         """Setup main UI"""
@@ -668,49 +659,46 @@ class ByteDogApp:
 
     def create_minimal_view(self):
         """Create the minimal League of Legends style view - FIXED ARROW VISIBILITY"""
-        self.minimal_frame = tk.Frame(self.root, bg='black', padx=8, pady=4)
+        c = self.colors
+        self.minimal_frame = tk.Frame(self.root, bg=c['surface'], padx=10, pady=5)
 
         # Single frame to hold all elements in one line
-        content_frame = tk.Frame(self.minimal_frame, bg='black')
+        content_frame = tk.Frame(self.minimal_frame, bg=c['surface'])
         content_frame.pack()
 
         # Status dot (left side)
         self.minimal_dot_canvas = tk.Canvas(content_frame, width=12, height=12,
-                                            bg='black', highlightthickness=0)
+                                            bg=c['surface'], highlightthickness=0)
         self.minimal_dot_canvas.pack(side=tk.LEFT, padx=(0, 6))
         self.minimal_dot = self.minimal_dot_canvas.create_oval(2, 2, 10, 10,
-                                                               fill='gray', outline='white', width=1)
+                                                               fill=c['faint'], outline='')
 
         # System metrics text (middle)
         self.minimal_metrics_label = tk.Label(content_frame, text="CPU: -- | RAM: --",
-                                              fg='white', bg='black',
-                                              font=('Arial', 10, 'bold'))
+                                              fg=c['fg'], bg=c['surface'],
+                                              font=ui_theme.font(10, 'bold'))
         self.minimal_metrics_label.pack(side=tk.LEFT)
 
         # FIXED: More visible arrow button with better styling
         self.minimal_expand_btn = tk.Label(
             content_frame,
             text="►",  # Using solid right-pointing triangle
-            font=("Arial", 14, "bold"),  # Larger font
-            fg="#00ff00",  # Bright green color for visibility
-            bg="black",
+            font=ui_theme.font(14, 'bold'),  # Larger font
+            fg=c['accent'],
+            bg=c['surface'],
             cursor="hand2",
             padx=8, pady=2,
-            relief="raised",  # Add some visual depth
-            bd=1  # Border for better visibility
         )
         self.minimal_expand_btn.pack(side=tk.LEFT, padx=(6, 0))
 
         # FIXED: Add hover effects to make the button more interactive
         def on_enter(e):
-            self.minimal_expand_btn.config(fg="#ffff00", relief="raised", bd=2)  # Yellow on hover
+            self.minimal_expand_btn.config(fg=self.colors['accent_hover'])
 
         def on_leave(e):
-            self.minimal_expand_btn.config(fg="#00ff00", relief="raised", bd=1)  # Back to green
+            self.minimal_expand_btn.config(fg=self.colors['accent'])
 
         def on_click(e):
-            self.minimal_expand_btn.config(relief="sunken")  # Visual feedback
-            self.root.after(100, lambda: self.minimal_expand_btn.config(relief="raised"))
             self.cycle_view_mode()
 
         self.minimal_expand_btn.bind("<Enter>", on_enter)
@@ -728,8 +716,8 @@ class ByteDogApp:
         title_frame = ttk.Frame(self.compact_frame)
         title_frame.pack(fill='x', pady=(0, 10))
 
-        title_label = ttk.Label(title_frame, text="ByteDog System Monitor",
-                                font=('Arial', 10, 'bold'))
+        title_label = ttk.Label(title_frame, text="ByteDog",
+                                font=ui_theme.heading_font(13))
         title_label.pack(side='left')
 
         # View toggle button
@@ -741,18 +729,18 @@ class ByteDogApp:
         status_frame = ttk.Frame(self.compact_frame)
         status_frame.pack(fill='x', pady=(0, 10))
 
-        self.status_canvas = tk.Canvas(status_frame, width=20, height=20)
+        self.status_canvas = tk.Canvas(status_frame, width=14, height=14, bg=self.colors['bg'])
         self.status_canvas.pack(side=tk.LEFT)
-        self.status_indicator = self.status_canvas.create_oval(2, 2, 18, 18,
-                                                               fill='gray', outline='')
+        self.status_indicator = self.status_canvas.create_oval(2, 2, 12, 12,
+                                                               fill=self.colors['faint'], outline='')
 
         self.status_label = ttk.Label(status_frame, text="Ready")
-        self.status_label.pack(side=tk.LEFT, padx=(10, 0))
+        self.status_label.pack(side=tk.LEFT, padx=(6, 0))
 
         # Guardian status badge (right side)
         self.guardian_compact_label = tk.Label(status_frame, text="Shield: --",
                                                bg=self.colors['bg'], fg=self.colors['success'],
-                                               font=('Consolas', 8))
+                                               font=ui_theme.font(9))
         self.guardian_compact_label.pack(side=tk.RIGHT, padx=(5, 0))
 
         # System overview frame
@@ -761,21 +749,23 @@ class ByteDogApp:
 
         # Store metric cards for updates
         self.metric_cards = {}
+        for col in range(3 if GPU_AVAILABLE else 2):
+            overview_frame.columnconfigure(col, weight=1, uniform='metric')
 
         # CPU card
         cpu_card = self.create_metric_card(overview_frame, "CPU", 0, "%")
-        cpu_card.pack(side='left', padx=5)
+        cpu_card.grid(row=0, column=0, sticky='ew')
         self.metric_cards['cpu'] = cpu_card
 
         # Memory card
         mem_card = self.create_metric_card(overview_frame, "Memory", 0, "%")
-        mem_card.pack(side='left', padx=5)
+        mem_card.grid(row=0, column=1, sticky='ew', padx=(8, 0))
         self.metric_cards['memory'] = mem_card
 
         # GPU card if available
         if GPU_AVAILABLE:
             gpu_card = self.create_metric_card(overview_frame, "GPU", 0, "%")
-            gpu_card.pack(side='left', padx=5)
+            gpu_card.grid(row=0, column=2, sticky='ew', padx=(8, 0))
             self.metric_cards['gpu'] = gpu_card
 
         # Top processes
@@ -783,7 +773,7 @@ class ByteDogApp:
         top_frame.pack(fill='both', expand=True, pady=10)
 
         tk.Label(top_frame, text="Using the most memory", bg=self.colors['bg'],
-                 fg=self.colors['fg'], font=('Arial', 12, 'bold')).pack(anchor='w', pady=5)
+                 fg=self.colors['fg'], font=ui_theme.heading_font(10)).pack(anchor='w', pady=(0, 4))
 
         # Simple process list for compact view
         self.create_simple_process_list(top_frame)
@@ -796,8 +786,8 @@ class ByteDogApp:
         title_frame = ttk.Frame(self.detailed_frame)
         title_frame.pack(fill='x', pady=(0, 10))
 
-        title_label = ttk.Label(title_frame, text="ByteDog - Detailed View",
-                                font=('Arial', 10, 'bold'))
+        title_label = ttk.Label(title_frame, text="ByteDog",
+                                font=ui_theme.heading_font(13))
         title_label.pack(side='left')
 
         # View toggle button
@@ -872,6 +862,11 @@ class ByteDogApp:
         view_menu.add_command(label="Compact", command=lambda: self.set_view_mode("compact"))
         view_menu.add_command(label="Detailed", command=lambda: self.set_view_mode("detailed"))
         view_menu.add_separator()
+        theme_menu = tk.Menu(view_menu, tearoff=0)
+        view_menu.add_cascade(label="Theme", menu=theme_menu)
+        for value, label in (('system', 'Match Windows'), ('light', 'Light'), ('dark', 'Dark')):
+            theme_menu.add_radiobutton(label=label, value=value, variable=self.theme_choice,
+                                       command=self.apply_theme_choice)
         view_menu.add_checkbutton(label="See-through window", variable=self.see_through,
                                   command=self.apply_see_through)
 
@@ -937,7 +932,7 @@ class ByteDogApp:
             # Compact mode - essential info with window decorations
             self.root.overrideredirect(False)
             self.compact_frame.pack(fill='both', expand=True)
-            self.root.geometry("340x345")
+            self.root.geometry(COMPACT_SIZE)
             if hasattr(self, 'toggle_btn'):
                 self.toggle_btn.config(text="▼")
             if hasattr(self, 'menubar'):
@@ -956,22 +951,22 @@ class ByteDogApp:
                 self.root.config(menu=self.menubar)  # restore menubar
             # Restart guardian tab and performance graph refresh loops
             self.root.after(200, self.update_guardian_tab)
-            self.root.after(200, self.update_performance_graph)
             self._maybe_refresh_active_process_tab()
 
     def create_metric_card(self, parent, title, value, unit):
-        """Create a metric display card"""
-        card = tk.Frame(parent, bg=self.colors['button'], relief='raised', bd=1)
-        card.configure(width=90, height=70)
+        """A small surface card: caption on top, the big number under it."""
+        c = self.colors
+        card = tk.Frame(parent, bg=c['surface'], highlightthickness=1,
+                        highlightbackground=c['border'], height=64)
         card.pack_propagate(False)
 
-        card.title_label = tk.Label(card, text=title, bg=self.colors['button'], fg=self.colors['fg'],
-                                    font=('Arial', 9))
-        card.title_label.pack(pady=2)
+        card.title_label = tk.Label(card, text=title, bg=c['surface'], fg=c['muted'],
+                                    font=ui_theme.font(9))
+        card.title_label.pack(pady=(6, 0))
 
         card.value_label = tk.Label(card, text=f"{value:.0f}{unit}",
-                                    bg=self.colors['button'], fg=self.colors['success'],
-                                    font=('Arial', 14, 'bold'))
+                                    bg=c['surface'], fg=c['success'],
+                                    font=ui_theme.heading_font(16))
         card.value_label.pack()
 
         return card
@@ -979,15 +974,14 @@ class ByteDogApp:
     def update_metric_card(self, card, value, unit="%"):
         """Update a metric card's value"""
         if isinstance(value, (int, float)):
-            color = self.colors['success'] if value < 50 else self.colors['warning'] if value < 80 else self.colors[
-                'error']
-            card.value_label.config(text=f"{value:.0f}{unit}", fg=color)
+            card.value_label.config(text=f"{value:.0f}{unit}", fg=ui_theme.level_color(value))
 
     def create_simple_process_list(self, parent):
         """Create simple process list for compact view"""
         # Simple text display for top processes
-        self.process_display = tk.Text(parent, height=8, bg=self.colors['button'],
-                                       fg=self.colors['fg'], font=('Consolas', 9),
+        self.process_display = tk.Text(parent, height=8, bg=self.colors['surface'],
+                                       fg=self.colors['fg'], font=ui_theme.mono(9),
+                                       highlightthickness=1, highlightbackground=self.colors['border'],
                                        state='disabled', cursor='hand2', relief='flat')
         self.process_display.pack(fill='both', expand=True)
         self.process_display.bind('<Button-1>', lambda e: self.open_guardian_tab())
@@ -1038,51 +1032,15 @@ class ByteDogApp:
         # Protected processes (system-critical, or user-added to the
         # never-touch list) are greyed out so it's obvious at a glance which
         # rows Kill/Suspend won't act on without an explicit override.
-        self.process_tree.tag_configure('protected', foreground='#777777')
+        self.process_tree.tag_configure('protected', foreground=self.colors['faint'])
 
         # Context menu
         self.process_tree.bind('<Button-3>', self.show_process_menu)
 
     def create_overview_tab(self, parent):
-        """Create overview tab content"""
-        # System info
-        info_frame = ttk.Frame(parent)
-        info_frame.pack(fill='x', padx=20, pady=10)
-
-        system_info = f"System: {platform.system()} {platform.release()}\n"
-        system_info += f"Processor: {platform.processor() or 'Unknown'}\n"
-        system_info += f"CPU Cores: {psutil.cpu_count(logical=False)} physical, {psutil.cpu_count()} logical\n"
-
-        mem = psutil.virtual_memory()
-        system_info += f"Total Memory: {mem.total / (1024 ** 3):.1f} GB\n"
-
-        if GPU_AVAILABLE:
-            gpu_info = self.monitor.get_gpu_info()
-            if gpu_info:
-                system_info += f"GPU: {gpu_info['name']}\n"
-                system_info += f"GPU Memory: {gpu_info['memory_total']:.0f} MB"
-
-        tk.Label(info_frame, text=system_info, bg=self.colors['bg'], fg=self.colors['fg'],
-                 font=('Consolas', 10), justify='left').pack(anchor='w')
-
-        # Current metrics
-        metrics_frame = ttk.Frame(parent)
-        metrics_frame.pack(fill='both', expand=True, padx=20, pady=10)
-
-        # CPU cores
-        tk.Label(metrics_frame, text="CPU Cores Usage:", bg=self.colors['bg'], fg=self.colors['fg'],
-                 font=('Arial', 11, 'bold')).pack(anchor='w', pady=5)
-
-        self.core_labels = []
-        cores_frame = ttk.Frame(metrics_frame)
-        cores_frame.pack(fill='x')
-
-        cpu_count = min(psutil.cpu_count(), 16)  # Limit display to 16 cores
-        for i in range(cpu_count):
-            label = tk.Label(cores_frame, text=f"Core {i}: 0%", bg=self.colors['bg'],
-                             fg=self.colors['fg'], font=('Consolas', 9))
-            label.grid(row=i // 4, column=i % 4, padx=10, pady=2, sticky='w')
-            self.core_labels.append(label)
+        self.overview_tab = OverviewTab(parent, self.monitor, GPU_AVAILABLE,
+                                        is_active=lambda: self._tab_active(parent))
+        self.overview_tab.pack(fill='both', expand=True)
 
     def create_process_tab(self, parent):
         """Create process management tab"""
@@ -1090,16 +1048,16 @@ class ByteDogApp:
         control_frame = ttk.Frame(parent)
         control_frame.pack(fill='x', padx=10, pady=10)
 
-        tk.Button(control_frame, text="🔄 Refresh", bg=self.colors['button'], fg=self.colors['fg'],
+        tk.Button(control_frame, text="Refresh", bg=self.colors['button'], fg=self.colors['fg'],
                   command=self.refresh_processes).pack(side='left', padx=2)
 
-        tk.Button(control_frame, text="❌ Kill Process", bg=self.colors['button'], fg=self.colors['fg'],
+        tk.Button(control_frame, text="Kill Process", bg=self.colors['danger_bg'], fg=self.colors['error'],
                   command=self.kill_selected_process).pack(side='left', padx=2)
 
-        tk.Button(control_frame, text="⏸ Suspend", bg=self.colors['button'], fg=self.colors['fg'],
+        tk.Button(control_frame, text="Suspend", bg=self.colors['button'], fg=self.colors['fg'],
                   command=self.suspend_selected_process).pack(side='left', padx=2)
 
-        tk.Button(control_frame, text="▶ Resume", bg=self.colors['button'], fg=self.colors['fg'],
+        tk.Button(control_frame, text="Resume", bg=self.colors['button'], fg=self.colors['fg'],
                   command=self.resume_selected_process).pack(side='left', padx=2)
 
         # Search box
@@ -1107,7 +1065,7 @@ class ByteDogApp:
                                                                                                  padx=(20, 5))
         self.search_var = tk.StringVar()
         self.search_var.trace('w', lambda *args: self.filter_processes())
-        search_entry = tk.Entry(control_frame, textvariable=self.search_var, bg=self.colors['button'],
+        search_entry = tk.Entry(control_frame, textvariable=self.search_var, bg=self.colors['surface'],
                                 fg=self.colors['fg'], insertbackground=self.colors['fg'])
         search_entry.pack(side='left')
 
@@ -1118,27 +1076,22 @@ class ByteDogApp:
         self.process_tree.bind('<<TreeviewSelect>>', self._on_process_select, add='+')
 
     def create_performance_tab(self, parent):
-        """Create performance graphs tab"""
-        tk.Label(parent, text="Performance History", bg=self.colors['bg'], fg=self.colors['fg'],
-                 font=('Arial', 14, 'bold')).pack(pady=10)
-
-        # Simple text-based graph
-        self.perf_text = tk.Text(parent, bg=self.colors['button'], fg=self.colors['fg'],
-                                 font=('Consolas', 9), height=20)
-        self.perf_text.pack(fill='both', expand=True, padx=20, pady=10)
-
-        self.update_performance_graph()
+        self.performance_tab = PerformanceTab(parent, self.monitor, GPU_AVAILABLE,
+                                              is_active=lambda: self._tab_active(parent),
+                                              sample_s=HISTORY_SAMPLE_MS / 1000)
+        self.performance_tab.pack(fill='both', expand=True)
 
     def create_network_tab(self, parent):
-        """Create network monitoring tab"""
-        tk.Label(parent, text="Network Statistics", bg=self.colors['bg'], fg=self.colors['fg'],
-                 font=('Arial', 14, 'bold')).pack(pady=10)
+        self.network_tab = NetworkTab(parent, is_active=lambda: self._tab_active(parent))
+        self.network_tab.pack(fill='both', expand=True)
 
-        self.net_info_label = tk.Label(parent, text="", bg=self.colors['bg'], fg=self.colors['fg'],
-                                       font=('Consolas', 10), justify='left')
-        self.net_info_label.pack(pady=20)
-
-        self.update_network_info()
+    def _tab_active(self, tab) -> bool:
+        """A tab's own refresh loop only works while the user can see it."""
+        try:
+            return (self.view_mode.get() == 'detailed'
+                    and self.detailed_notebook.select() == str(tab))
+        except (AttributeError, tk.TclError):
+            return False
 
     def create_context_menu(self):
         """Create right-click context menu"""
@@ -1175,6 +1128,28 @@ class ByteDogApp:
         """Solid by default; the View menu toggle makes the window see-through."""
         alpha = SEE_THROUGH_ALPHA if self.see_through.get() else 1.0
         self.root.attributes('-alpha', alpha)
+        self._save_prefs()
+
+    def apply_theme_choice(self) -> None:
+        """View > Theme: re-colour everything now and remember the choice."""
+        ui_theme.switch(self.root, ui_theme.resolve(self.theme_choice.get()))
+        self._save_prefs()
+
+    def _follow_system_theme(self) -> None:
+        """'Match Windows' tracks the Windows app mode while ByteDog runs."""
+        if self.theme_choice.get() == 'system':
+            ui_theme.switch(self.root, ui_theme.resolve('system'))
+        self.root.after(SYSTEM_THEME_POLL_MS, self._follow_system_theme)
+
+    def _save_prefs(self) -> None:
+        prefs = ui_prefs.UiPrefs(theme=self.theme_choice.get(), see_through=self.see_through.get())
+        if prefs == self.prefs:
+            return
+        try:
+            ui_prefs.save(prefs)
+            self.prefs = prefs
+        except OSError as e:
+            self.report_status(f"Could not save display settings: {e}", ok=False)
 
     def show_minimal_view(self):
         """Show minimal overlay view"""
@@ -1283,14 +1258,14 @@ class ByteDogApp:
         dialog.resizable(False, False)
 
         tk.Label(dialog, text=f"⚠ '{name}' (PID {pid}) is a protected process",
-                bg=self.colors['bg'], fg=self.colors['error'], font=('Arial', 11, 'bold'),
+                bg=self.colors['bg'], fg=self.colors['error'], font=ui_theme.font(11, 'bold'),
                 wraplength=380, justify='left').pack(padx=16, pady=(16, 8), anchor='w')
         tk.Label(dialog, text=self._protection_text(pid, name), bg=self.colors['bg'], fg=self.colors['fg'],
-                font=('Arial', 10), wraplength=380, justify='left').pack(padx=16, pady=(0, 12), anchor='w')
+                font=ui_theme.font(10), wraplength=380, justify='left').pack(padx=16, pady=(0, 12), anchor='w')
         tk.Label(dialog,
                 text=f"ByteDog won't {verb.lower()} this process by default — only override "
                      f"if you understand and accept the risk above.",
-                bg=self.colors['bg'], fg=self.colors['warning'], font=('Arial', 9, 'italic'),
+                bg=self.colors['bg'], fg=self.colors['warning'], font=ui_theme.font(9, 'italic'),
                 wraplength=380, justify='left').pack(padx=16, pady=(0, 16), anchor='w')
 
         btn_frame = tk.Frame(dialog, bg=self.colors['bg'])
@@ -1307,7 +1282,7 @@ class ByteDogApp:
         tk.Button(btn_frame, text="Cancel", width=12, command=_cancel,
                  bg=self.colors['button'], fg=self.colors['fg']).pack(side='left', padx=6)
         tk.Button(btn_frame, text=f"Override & {verb} Anyway", width=22, command=_override,
-                 bg=self.colors['error'], fg='white').pack(side='left', padx=6)
+                 bg=self.colors['danger_bg'], fg=self.colors['error']).pack(side='left', padx=6)
 
         dialog.protocol("WM_DELETE_WINDOW", _cancel)
         dialog.update_idletasks()
@@ -1628,7 +1603,8 @@ class ByteDogApp:
         self.process_display.delete(1.0, tk.END)
         self.process_display.insert(1.0, "\n".join(lines))
         self.process_display.tag_add('hint', 'end-2l', 'end')
-        self.process_display.tag_config('hint', foreground='#888888')
+        self.process_display.tag_config('hint', foreground=self.colors['faint'],
+                                        font=ui_theme.font(8))
         self.process_display.config(state='disabled')
 
     def update_metrics(self):
@@ -1660,12 +1636,7 @@ class ByteDogApp:
                 if GPU_AVAILABLE and gpu_info:
                     max_usage = max(max_usage, gpu_info['load'])
 
-                if max_usage < 50:
-                    dot_color = 'lime'
-                elif max_usage < 80:
-                    dot_color = 'yellow'
-                else:
-                    dot_color = 'red'
+                dot_color = ui_theme.level_color(max_usage)
 
                 self.minimal_dot_canvas.itemconfig(self.minimal_dot, fill=dot_color)
 
@@ -1685,10 +1656,11 @@ class ByteDogApp:
 
                 # Update status indicator
                 overall_status = self.calculate_overall_status(cpu, mem['percent'], gpu_info)
-                status_colors = {'good': 'green', 'fair': 'orange', 'poor': 'red'}
+                status_colors = {'good': self.colors['success'], 'fair': self.colors['warning'],
+                                 'poor': self.colors['error']}
                 if hasattr(self, 'status_canvas'):
                     self.status_canvas.itemconfig(self.status_indicator,
-                                                  fill=status_colors.get(overall_status, 'gray'))
+                                                  fill=status_colors.get(overall_status, self.colors['faint']))
                     self.status_label.config(text=f"Status: {overall_status.title()}")
 
                 # Update guardian compact badge
@@ -1697,7 +1669,7 @@ class ByteDogApp:
                     cfg = self.guardian.config
                     if not self.guardian.enabled:
                         g_text = "Shield: OFF"
-                        g_color = '#666666'
+                        g_color = self.colors['faint']
                     elif ram_pct >= cfg.act_pct:
                         g_text = f"Shield: {ram_pct:.0f}%!! ALERT"
                         g_color = self.colors['error']
@@ -1711,15 +1683,8 @@ class ByteDogApp:
 
             # Update detailed view
             elif self.view_mode.get() == "detailed":
-                # Update CPU cores if visible
-                if hasattr(self, 'core_labels'):
-                    cores = self.monitor.get_cpu_per_core()
-                    for i, label in enumerate(self.core_labels):
-                        if i < len(cores):
-                            usage = cores[i]
-                            color = self.colors['success'] if usage < 50 else self.colors['warning'] if usage < 80 else \
-                            self.colors['error']
-                            label.config(text=f"Core {i}: {usage:.1f}%", fg=color)
+                if hasattr(self, 'overview_tab') and self._tab_active(self.overview_tab.master):
+                    self.overview_tab.update_cores(self.monitor.get_cpu_per_core())
 
                 # Update process list if visible
                 if hasattr(self, 'process_tree'):
@@ -1749,114 +1714,6 @@ class ByteDogApp:
             return 'fair'
         else:
             return 'poor'
-
-    def update_performance_graph(self):
-        """Render performance history graphs (history accumulates in
-        update_metrics; this only draws)."""
-        if not hasattr(self, 'perf_text'):
-            return
-
-        # Create text-based graph
-        graph_height = 15
-        graph_width = 60
-
-        # Redraw resets scroll to top; remember where the user was
-        scroll_pos = self.perf_text.yview()[0]
-        self.perf_text.delete(1.0, tk.END)
-
-        # CPU Graph
-        self.perf_text.insert(tk.END, "CPU Usage History\n", 'title')
-        self.perf_text.insert(tk.END, self.create_text_graph(self.monitor.cpu_history, graph_height, graph_width))
-        self.perf_text.insert(tk.END, "\n\n")
-
-        # RAM Graph
-        self.perf_text.insert(tk.END, "Memory Usage History\n", 'title')
-        self.perf_text.insert(tk.END, self.create_text_graph(self.monitor.ram_history, graph_height, graph_width))
-
-        # GPU Graph if available
-        if GPU_AVAILABLE and self.monitor.gpu_history:
-            self.perf_text.insert(tk.END, "\n\n")
-            self.perf_text.insert(tk.END, "GPU Usage History\n", 'title')
-            self.perf_text.insert(tk.END, self.create_text_graph(self.monitor.gpu_history, graph_height, graph_width))
-
-        # Configure text tags
-        self.perf_text.tag_config('title', foreground=self.colors['accent'], font=('Arial', 11, 'bold'))
-
-        # Restore scroll position (content length is stable across redraws)
-        self.perf_text.yview_moveto(scroll_pos)
-
-        # Schedule next update
-        if self.view_mode.get() == 'detailed':
-            self.root.after(2000, self.update_performance_graph)
-
-    def create_text_graph(self, data, height, width):
-        """Create ASCII graph from data"""
-        if not data:
-            return "No data available\n"
-
-        graph = []
-
-        # Filter out None values
-        valid_data = [v for v in data if v is not None]
-        if len(valid_data) < 2:
-            return "Collecting data...\n"
-
-        # Scale data to fit height
-        max_val = max(valid_data)
-        min_val = min(valid_data)
-
-        if max_val == min_val:
-            max_val += 1
-
-        # Create graph lines
-        for h in range(height, -1, -1):
-            threshold = (h / height) * max_val
-            line = f"{threshold:3.0f}% |"
-
-            for i, val in enumerate(list(valid_data)[-width:]):
-                if val >= threshold:
-                    line += "█"
-                else:
-                    line += " "
-
-            graph.append(line + "\n")
-
-        # Add bottom axis
-        graph.append("     +" + "-" * min(len(valid_data), width) + "\n")
-        graph.append("      " + "".join(
-            [str(i % 10) if i % 10 == 0 else " " for i in range(min(len(valid_data), width))]) + "\n")
-
-        return "".join(graph)
-
-    def update_network_info(self):
-        """Update network information display"""
-        if not hasattr(self, 'net_info_label'):
-            return
-
-        net = self.monitor.get_network_info()
-
-        info = f"Network Statistics\n" + "=" * 50 + "\n"
-        info += f"Bytes Sent: {self.format_bytes(net['bytes_sent'])}\n"
-        info += f"Bytes Received: {self.format_bytes(net['bytes_recv'])}\n"
-        info += f"Packets Sent: {net['packets_sent']:,}\n"
-        info += f"Packets Received: {net['packets_recv']:,}\n"
-
-        # Get network interfaces
-        info += "\n" + "Network Interfaces\n" + "-" * 30 + "\n"
-        try:
-            for interface, addrs in psutil.net_if_addrs().items():
-                info += f"\n{interface}:\n"
-                for addr in addrs:
-                    if addr.family == 2:  # IPv4
-                        info += f"  IPv4: {addr.address}\n"
-        except:
-            info += "  Unable to retrieve interface details\n"
-
-        self.net_info_label.config(text=info)
-
-        # Schedule next update
-        if self.view_mode.get() == 'detailed':
-            self.root.after(2000, self.update_network_info)
 
     def start_monitoring(self):
         """Start the fast monitoring thread — CPU and RAM only, never blocks."""
@@ -2002,8 +1859,8 @@ class ByteDogApp:
         report_window.configure(bg=self.colors['bg'])
         apply_window_icon(report_window)
 
-        text = tk.Text(report_window, bg=self.colors['button'], fg=self.colors['fg'],
-                       font=('Consolas', 10))
+        text = tk.Text(report_window, bg=self.colors['surface'], fg=self.colors['fg'],
+                       font=ui_theme.mono(10))
         text.pack(fill='both', expand=True, padx=10, pady=10)
         text.insert(1.0, report)
         text.config(state='disabled')
@@ -2249,7 +2106,7 @@ Created with Python and psutil
         hdr.pack(fill='x', padx=12, pady=(8, 4))
 
         tk.Label(hdr, text="RAM Guardian", bg=bg, fg=fg,
-                 font=('Arial', 12, 'bold')).pack(side='left')
+                 font=ui_theme.font(12, 'bold')).pack(side='left')
 
         self.guardian_enabled_var = tk.BooleanVar(value=self.guardian.enabled)
         tk.Checkbutton(hdr, text="Active", variable=self.guardian_enabled_var,
@@ -2265,23 +2122,23 @@ Created with Python and psutil
                                    ('crit_pct', 'Kill hog', 70, 98)):
             row = tk.Frame(parent, bg=bg)
             row.pack(fill='x', padx=12, pady=0)
-            tk.Label(row, text=f"{label}:", bg=bg, fg=fg,
-                     font=('Arial', 8), width=12, anchor='w').pack(side='left')
+            tk.Label(row, text=label, bg=bg, fg=fg,
+                     font=ui_theme.font(9), width=13, anchor='w').pack(side='left')
             var = tk.DoubleVar(value=getattr(cfg, key))
             self.guardian_thresh_vars[key] = var
-            tk.Scale(row, from_=lo, to=hi, resolution=1,
-                     orient='horizontal', variable=var,
-                     bg=bg, fg=fg, highlightthickness=0,
-                     troughcolor=self.colors['button'],
-                     command=lambda v, k=key: self._update_guardian_threshold(k, v)
-                     ).pack(side='left', fill='x', expand=True, padx=6)
+            readout = tk.Label(row, text=f"{var.get():.0f}%", bg=bg, fg=self.colors['accent'],
+                               font=ui_theme.font(9, 'bold'), width=5, anchor='e')
+            readout.pack(side='right')
+            ttk.Scale(row, from_=lo, to=hi, orient='horizontal', variable=var,
+                      command=lambda v, k=key, r=readout: self._slide_threshold(k, v, r)
+                      ).pack(side='left', fill='x', expand=True, padx=6, pady=3)
 
         # ── Mode ──
         act_frame = tk.Frame(parent, bg=bg)
         act_frame.pack(fill='x', padx=12, pady=2)
 
         tk.Label(act_frame, text="Mode:", bg=bg, fg=fg,
-                 font=('Arial', 9)).pack(side='left')
+                 font=ui_theme.font(9)).pack(side='left')
         self.guardian_mode_var = tk.StringVar(value=cfg.mode)
         for val, lbl in [('escalate', 'Escalating auto-action'), ('alert_only', 'Alert only')]:
             tk.Radiobutton(act_frame, text=lbl, value=val,
@@ -2295,48 +2152,48 @@ Created with Python and psutil
         prot_frame = tk.Frame(parent, bg=bg)
         prot_frame.pack(fill='x', padx=12, pady=2)
         tk.Label(prot_frame, text="Never touch:", bg=bg, fg=fg,
-                 font=('Arial', 8)).pack(side='left')
+                 font=ui_theme.font(9)).pack(side='left')
         self.guardian_protected_var = tk.StringVar(
             value=", ".join(cfg.user_protected))
         tk.Entry(prot_frame, textvariable=self.guardian_protected_var,
-                 bg=self.colors['button'], fg=fg,
-                 insertbackground=fg, font=('Consolas', 8)
+                 bg=self.colors['surface'], fg=fg,
+                 insertbackground=fg, font=ui_theme.mono(9)
                  ).pack(side='left', fill='x', expand=True, padx=6)
         tk.Button(prot_frame, text="Save", bg=self.colors['button'], fg=fg,
-                  font=('Arial', 8), relief='flat',
+                  font=ui_theme.font(9), relief='flat',
                   command=self._save_guardian_protected).pack(side='right')
 
         # ── Current RAM status ──
         ram_row = tk.Frame(parent, bg=bg)
         ram_row.pack(fill='x', padx=12, pady=(6, 2))
 
-        tk.Label(ram_row, text="RAM now:", bg=bg, fg=fg, font=('Arial', 9)).pack(side='left')
+        tk.Label(ram_row, text="RAM now:", bg=bg, fg=fg, font=ui_theme.font(9)).pack(side='left')
         self.guardian_ram_lbl = tk.Label(ram_row, text="--", bg=bg,
                                          fg=self.colors['success'],
-                                         font=('Arial', 11, 'bold'))
+                                         font=ui_theme.font(11, 'bold'))
         self.guardian_ram_lbl.pack(side='left', padx=6)
 
         # Manual kill button
         tk.Button(ram_row, text="Kill Top Hog Now",
-                  bg='#5a1a1a', fg='white', font=('Arial', 8),
+                  bg=self.colors['danger_bg'], fg=self.colors['error'], font=ui_theme.font(9),
                   relief='flat', command=self._kill_top_hog_now
                   ).pack(side='right')
-        tk.Button(ram_row, text="Suspend Top", bg=self.colors['button'], fg='white',
-                  font=('Arial', 8), relief='flat', command=self._suspend_top_hog_now
+        tk.Button(ram_row, text="Suspend Top", bg=self.colors['button'], fg=fg,
+                  font=ui_theme.font(9), relief='flat', command=self._suspend_top_hog_now
                   ).pack(side='right', padx=(0, 6))
-        tk.Button(ram_row, text="Resume All", bg=self.colors['button'], fg='white',
-                  font=('Arial', 8), relief='flat', command=self._resume_all_suspended
+        tk.Button(ram_row, text="Resume All", bg=self.colors['button'], fg=fg,
+                  font=ui_theme.font(9), relief='flat', command=self._resume_all_suspended
                   ).pack(side='right', padx=(0, 6))
 
         # ── Divider ──
-        tk.Frame(parent, height=1, bg=self.colors['select']).pack(fill='x', padx=12, pady=4)
+        tk.Frame(parent, height=1, bg=self.colors['border']).pack(fill='x', padx=12, pady=6)
 
         # ── Split: hogs + event log ──
         split = tk.Frame(parent, bg=bg)
         split.pack(fill='both', expand=True, padx=12)
 
         tk.Label(split, text="Processes, ranked in the order Suspend Top / Kill Top Hog act",
-                 bg=bg, fg=fg, font=('Arial', 9, 'bold')).pack(anchor='w')
+                 bg=bg, fg=fg, font=ui_theme.font(9, 'bold')).pack(anchor='w')
         self.guardian_panel = HogPanel(split, self)
         self.guardian_panel.pack(fill='both', expand=True, pady=(2, 4))
 
@@ -2344,19 +2201,19 @@ Created with Python and psutil
         right.pack(fill='x')
 
         tk.Label(right, text="Event Log", bg=bg, fg=fg,
-                 font=('Arial', 9, 'bold')).pack(anchor='w')
-        self.guardian_log_text = tk.Text(right, height=5, bg=self.colors['button'],
-                                         fg=fg, font=('Consolas', 7),
+                 font=ui_theme.font(9, 'bold')).pack(anchor='w')
+        self.guardian_log_text = tk.Text(right, height=5, bg=self.colors['surface'],
+                                         fg=fg, font=ui_theme.mono(8),
                                          state='disabled', width=28, relief='flat')
         self.guardian_log_text.pack(fill='both', expand=True, pady=2)
 
         # ── Leak suspects ──
-        tk.Frame(parent, height=1, bg=self.colors['select']).pack(fill='x', padx=12, pady=(4, 2))
+        tk.Frame(parent, height=1, bg=self.colors['border']).pack(fill='x', padx=12, pady=(4, 2))
         tk.Label(parent, text="Memory Leak Suspects  (growing >50 MB/min)",
                  bg=bg, fg=self.colors['warning'],
-                 font=('Arial', 8, 'bold')).pack(anchor='w', padx=12)
-        self.guardian_leak_text = tk.Text(parent, height=3, bg=self.colors['button'],
-                                          fg=self.colors['warning'], font=('Consolas', 8),
+                 font=ui_theme.font(9, 'bold')).pack(anchor='w', padx=12)
+        self.guardian_leak_text = tk.Text(parent, height=3, bg=self.colors['surface'],
+                                          fg=self.colors['warning'], font=ui_theme.mono(9),
                                           state='disabled', relief='flat')
         self.guardian_leak_text.pack(fill='x', padx=12, pady=(2, 6))
 
@@ -2375,13 +2232,13 @@ Created with Python and psutil
         control_frame = ttk.Frame(parent)
         control_frame.pack(fill='x', padx=10, pady=10)
 
-        tk.Button(control_frame, text="🔄 Refresh", bg=self.colors['button'], fg=fg,
+        tk.Button(control_frame, text="Refresh", bg=self.colors['button'], fg=fg,
                   command=self.refresh_services).pack(side='left', padx=2)
 
-        tk.Button(control_frame, text="▶ Start", bg=self.colors['button'], fg=fg,
+        tk.Button(control_frame, text="Start", bg=self.colors['button'], fg=fg,
                   command=self._services_start_selected).pack(side='left', padx=2)
 
-        tk.Button(control_frame, text="⏹ Stop", bg=self.colors['button'], fg=fg,
+        tk.Button(control_frame, text="Stop", bg=self.colors['button'], fg=fg,
                   command=self._services_stop_selected).pack(side='left', padx=2)
 
         # Search box
@@ -2389,7 +2246,7 @@ Created with Python and psutil
         self.services_search_var = tk.StringVar()
         self.services_search_var.trace('w', lambda *args: self.filter_services())
         search_entry = tk.Entry(control_frame, textvariable=self.services_search_var,
-                                bg=self.colors['button'], fg=fg, insertbackground=fg)
+                                bg=self.colors['surface'], fg=fg, insertbackground=fg)
         search_entry.pack(side='left')
 
         # Frame for list and scrollbars
@@ -2417,8 +2274,8 @@ Created with Python and psutil
         self.services_tree.pack(fill='both', expand=True)
 
         # Colour running/stopped so state is obvious at a glance
-        self.services_tree.tag_configure('svc_running', foreground=self.colors['success'])
-        self.services_tree.tag_configure('svc_stopped', foreground='#777777')
+        self.services_tree.tag_configure('svc_running', foreground=self.colors['fg'])
+        self.services_tree.tag_configure('svc_stopped', foreground=self.colors['faint'])
 
         # Sort/filter state — kept fully separate from the Processes tab's
         # self.sort_column / self.process_tree so the two tabs never collide.
@@ -2594,7 +2451,7 @@ Created with Python and psutil
         control_frame = ttk.Frame(parent)
         control_frame.pack(fill='x', padx=10, pady=10)
 
-        tk.Button(control_frame, text="🔄 Refresh", bg=self.colors['button'], fg=fg,
+        tk.Button(control_frame, text="Refresh", bg=self.colors['button'], fg=fg,
                   command=self._startup_refresh).pack(side='left', padx=2)
 
         self.startup_toggle_btn = tk.Button(control_frame, text="Enable/Disable",
@@ -2605,13 +2462,13 @@ Created with Python and psutil
         tk.Label(control_frame, text="Search:", bg=bg, fg=fg).pack(side='left', padx=(20, 5))
         self.startup_search_var = tk.StringVar()
         self.startup_search_var.trace('w', lambda *args: self._startup_apply_filter())
-        tk.Entry(control_frame, textvariable=self.startup_search_var, bg=self.colors['button'],
+        tk.Entry(control_frame, textvariable=self.startup_search_var, bg=self.colors['surface'],
                  fg=fg, insertbackground=fg).pack(side='left')
 
         # Explains why the toggle button is disabled for the current
         # selection (e.g. an HKLM entry while not running elevated).
         self.startup_status_label = tk.Label(control_frame, text="", bg=bg,
-                                             fg=self.colors['warning'], font=('Arial', 8))
+                                             fg=self.colors['warning'], font=ui_theme.font(9))
         self.startup_status_label.pack(side='left', padx=(20, 0))
 
         list_frame = ttk.Frame(parent)
@@ -2638,7 +2495,7 @@ Created with Python and psutil
         # Disabled entries greyed out; admin-required rows called out in the
         # warning color so it's obvious at a glance which ones can't be
         # toggled without relaunching elevated.
-        self.startup_tree.tag_configure('disabled', foreground='#777777')
+        self.startup_tree.tag_configure('disabled', foreground=self.colors['faint'])
         self.startup_tree.tag_configure('admin_required', foreground=self.colors['warning'])
 
         self.startup_tree.bind('<<TreeviewSelect>>', self._startup_on_select)
@@ -2855,7 +2712,7 @@ Created with Python and psutil
         control_frame = ttk.Frame(parent)
         control_frame.pack(fill='x', padx=10, pady=10)
 
-        tk.Button(control_frame, text="🔄 Refresh", bg=self.colors['button'], fg=self.colors['fg'],
+        tk.Button(control_frame, text="Refresh", bg=self.colors['button'], fg=self.colors['fg'],
                   command=self.refresh_users).pack(side='left', padx=2)
 
         # Frame for list and scrollbar
@@ -2906,6 +2763,13 @@ Created with Python and psutil
     def _update_guardian_threshold(self, key, val):
         setattr(self.guardian.config, key, float(val))
         self.guardian.save_config()
+
+    def _slide_threshold(self, key, val, readout):
+        """ttk sliders report fractions: snap to whole percent, save on change."""
+        pct = round(float(val))
+        readout.config(text=f"{pct}%")
+        if pct != getattr(self.guardian.config, key):
+            self._update_guardian_threshold(key, pct)
 
     def _update_guardian_mode(self):
         self.guardian.config.mode = self.guardian_mode_var.get()
@@ -3004,8 +2868,8 @@ Created with Python and psutil
 
         # Event log (instant — reads from deque)
         level_icons = {'info': ' ', 'warn': '!', 'critical': '!!', 'action': '>'}
-        level_colors = {'info': '#888888', 'warn': '#ff9800',
-                        'critical': '#f44336', 'action': '#4caf50'}
+        level_colors = {'info': self.colors['muted'], 'warn': self.colors['warning'],
+                        'critical': self.colors['error'], 'action': self.colors['success']}
         self.guardian_log_text.config(state='normal')
         self.guardian_log_text.delete(1.0, tk.END)
         with self.guardian._lock:
@@ -3015,7 +2879,7 @@ Created with Python and psutil
                 tag = entry['level']
                 self.guardian_log_text.insert(tk.END, line, tag)
                 self.guardian_log_text.tag_config(
-                    tag, foreground=level_colors.get(entry['level'], '#888888'))
+                    tag, foreground=level_colors.get(entry['level'], self.colors['muted']))
         self.guardian_log_text.config(state='disabled')
 
         # Leak suspects — history accumulates from the live snapshots above
@@ -3043,7 +2907,7 @@ Created with Python and psutil
         """Start the application"""
         # Start metric updates
         self.update_metrics()
-        self.root.after(2000, self.schedule_metric_updates)
+        self.root.after(HISTORY_SAMPLE_MS, self.schedule_metric_updates)
         self.root.after(15000, self._process_tab_autorefresh_tick)
 
         # Handle window closing
@@ -3061,7 +2925,7 @@ Created with Python and psutil
     def schedule_metric_updates(self):
         """Schedule regular metric updates"""
         self.update_metrics()
-        self.root.after(2000, self.schedule_metric_updates)
+        self.root.after(HISTORY_SAMPLE_MS, self.schedule_metric_updates)
 
     def on_closing(self):
         """Handle application closing"""
