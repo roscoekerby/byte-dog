@@ -32,3 +32,13 @@ unique in the file. Assert `old` is non-empty and `s.count(old) == 1` before eve
 replace (the bytedog.py patch script did this and refused to write; the todo patch did
 not). For append-only notes like `tasks/todo.md`, append; do not re-slice earlier text.
 Check `wc -l` / `git diff --stat` on non-code files before committing them.
+
+## 2026-10-12: a cancelled UAC step must stop the rebuild chain
+
+A one-line `taskkill (RunAs); build; sign; Start-Process ByteDog.exe` kept going after
+the UAC prompt was cancelled. The build failed, and the launch started a second
+(non-elevated) ByteDog next to the running elevated one. The user then hit its
+"Admin required" dialog and thought restarting elevated had failed.
+**Rule:** gate each step of kill/build/launch on the previous one succeeding
+(`-ErrorAction Stop` / check `$?`). Never launch the app while an old instance is still
+running.
