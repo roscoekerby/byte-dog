@@ -107,7 +107,12 @@ before that point.
   itself with a UAC prompt so kill/suspend and working-set pinning work at
   full strength without you having to fight a frozen Explorer to manually
   "Run as administrator" mid-thrash. Declining the prompt is fine — it
-  keeps running non-elevated, just with reduced kill/suspend coverage
+  keeps running non-elevated, just with reduced kill/suspend coverage. Later,
+  anything that needs admin (such as toggling a machine-wide HKLM startup
+  entry) offers to restart ByteDog as administrator instead of just refusing
+- **Single instance:** a second launch says ByteDog is already running and
+  exits, so two guardians never fight over the same hogs. A restart as
+  administrator waits up to 15 s for the old instance to close
 - **Auto-start:** installed once on first launch as a per-user Run-key entry
   (Tools menu can remove or reinstall it). The entry follows whatever launched
   ByteDog last, so switching from the script to `ByteDog.exe` updates it

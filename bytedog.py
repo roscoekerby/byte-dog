@@ -35,6 +35,7 @@ from safety import ProtectionChecker
 from process_tools_ui import DetailsPane, ProcessTools
 from guardian_toast import build_toast
 from hog_panel import HogPanel
+import single_instance
 import ui_prefs
 import ui_theme
 from network_tab import NetworkTab
@@ -2655,10 +2656,9 @@ Created with Python and psutil
         self._startup_on_select()
 
     def _startup_on_select(self, event=None):
-        """Enable/disable the toggle button (and explain why) based on
-        whether the current selection is an HKLM entry while not running
-        elevated — real Task Manager also requires admin for machine-wide
-        Run entries."""
+        """Enable the toggle button when a row is selected. An HKLM entry
+        while not elevated stays clickable: it offers a restart as admin,
+        since machine-wide Run entries need admin (as in Task Manager)."""
         if not hasattr(self, 'startup_tree') or not hasattr(self, 'startup_toggle_btn'):
             return
         selection = self.startup_tree.selection()
@@ -2667,8 +2667,9 @@ Created with Python and psutil
             self.startup_toggle_btn.config(state='disabled')
             self.startup_status_label.config(text='')
         elif item['requires_admin'] and not is_admin():
-            self.startup_toggle_btn.config(state='disabled')
-            self.startup_status_label.config(text='Requires admin to modify machine-wide entries')
+            self.startup_toggle_btn.config(state='normal')
+            self.startup_status_label.config(
+                text='Machine-wide entry: ByteDog will offer to restart as administrator')
         else:
             self.startup_toggle_btn.config(state='normal')
             self.startup_status_label.config(text='')
@@ -2692,10 +2693,7 @@ Created with Python and psutil
         if not item:
             return
         if item['requires_admin'] and not is_admin():
-            messagebox.showinfo(
-                "Admin required",
-                "Modifying machine-wide (HKLM) startup entries requires running "
-                "ByteDog as Administrator.")
+            self.offer_admin_restart("Changing machine-wide (HKLM) startup entries")
             return
         ok, message = self._startup_set_approved_state(
             item['value_name'], item['folder'], not item['enabled'])
@@ -2927,6 +2925,23 @@ Created with Python and psutil
         self.update_metrics()
         self.root.after(HISTORY_SAMPLE_MS, self.schedule_metric_updates)
 
+    def offer_admin_restart(self, action: str) -> bool:
+        """Ask to restart elevated; on yes, launch the elevated instance and
+        quit this one (it waits for our single-instance mutex to free up)."""
+        if not messagebox.askyesno(
+                "Administrator needed",
+                f"{action} needs ByteDog to run as administrator.\n\n"
+                "Restart ByteDog as administrator now?", parent=self.root):
+            return False
+        if not relaunch_elevated([single_instance.RESTART_FLAG]):
+            messagebox.showwarning(
+                "Administrator needed",
+                "ByteDog was not restarted: the Windows admin prompt was declined "
+                "or could not be shown.", parent=self.root)
+            return False
+        self.root.quit()
+        return True
+
     def on_closing(self):
         """Handle application closing"""
         self.root.quit()
@@ -2946,6 +2961,18 @@ def main():
                 return  # elevated instance is starting; this one exits
             print("Elevation declined or unavailable — continuing without admin rights "
                   "(some kill/suspend actions on other users' or hardened processes may fail).")
+
+    # One guardian at a time. A restart-as-admin starts before the old
+    # instance has exited, so it waits for the old one to let go.
+    wait_s = single_instance.RESTART_WAIT_S if single_instance.RESTART_FLAG in sys.argv else 0
+    instance = single_instance.acquire(wait_s=wait_s)
+    if instance is None:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo("ByteDog", "ByteDog is already running; switch to it from "
+                                       "the taskbar.", parent=root)
+        root.destroy()
+        return
 
     # Check if GPU monitoring is available
     if GPU_AVAILABLE:

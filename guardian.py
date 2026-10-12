@@ -428,25 +428,26 @@ def is_admin() -> bool:
         return False
 
 
-def _elevate_command() -> tuple:
+def _elevate_command(extra_args: tuple | list = ()) -> tuple:
     """(executable, params) used to relaunch ByteDog elevated via ShellExecuteW."""
+    passed = [a for a in sys.argv[1:] if a not in extra_args] + list(extra_args)
     if getattr(sys, 'frozen', False):
-        return sys.executable, ' '.join(f'"{a}"' for a in sys.argv[1:])
+        return sys.executable, ' '.join(f'"{a}"' for a in passed)
     pythonw = Path(sys.executable).with_name('pythonw.exe')
     interpreter = pythonw if pythonw.exists() else Path(sys.executable)
     script = Path(__file__).with_name('bytedog.py')
-    args = [str(script)] + sys.argv[1:]
+    args = [str(script)] + passed
     return str(interpreter), ' '.join(f'"{a}"' for a in args)
 
 
-def relaunch_elevated() -> bool:
+def relaunch_elevated(extra_args: tuple | list = ()) -> bool:
     """Relaunch ByteDog with a UAC elevation prompt. Returns True if a new
     elevated instance was launched (caller should exit this one); False if
     the user declined the prompt or the relaunch failed (caller should keep
     running non-elevated rather than block on it)."""
     if sys.platform != 'win32':
         return False
-    exe, params = _elevate_command()
+    exe, params = _elevate_command(extra_args)
     try:
         # >32 = success per ShellExecute docs (32 itself is the last error
         # code, everything <=32 is a failure); 1223 = user cancelled the UAC
