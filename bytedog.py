@@ -43,6 +43,7 @@ import gpu as gpu_backend
 GPU_AVAILABLE = gpu_backend.gpu_available()
 PROCESS_NAME_COLS = 30
 COMPACT_TOP_APPS = 6
+SEE_THROUGH_ALPHA = 0.9
 LOGICAL_CPUS = psutil.cpu_count() or 1
 
 
@@ -582,7 +583,8 @@ class ByteDogApp:
     def setup_window(self):
         """Configure the main window"""
         self.root.attributes('-topmost', True)
-        self.root.attributes('-alpha', 0.9)
+        self.see_through = tk.BooleanVar(master=self.root, value=False)
+        self.apply_see_through()
 
         # Position in top-right corner
         self.root.update_idletasks()
@@ -869,6 +871,9 @@ class ByteDogApp:
         view_menu.add_command(label="Minimal", command=lambda: self.set_view_mode("minimal"))
         view_menu.add_command(label="Compact", command=lambda: self.set_view_mode("compact"))
         view_menu.add_command(label="Detailed", command=lambda: self.set_view_mode("detailed"))
+        view_menu.add_separator()
+        view_menu.add_checkbutton(label="See-through window", variable=self.see_through,
+                                  command=self.apply_see_through)
 
         # Tools menu
         tools_menu = tk.Menu(menubar, tearoff=0, bg=self.colors['button'], fg=self.colors['fg'])
@@ -1143,6 +1148,8 @@ class ByteDogApp:
         self.context_menu.add_command(label="Detailed View", command=lambda: self.set_view_mode("detailed"))
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Always on Top", command=self.toggle_topmost)
+        self.context_menu.add_checkbutton(label="See-through window", variable=self.see_through,
+                                          command=self.apply_see_through)
         self.context_menu.add_command(label="Mini Window", command=self.show_minimal_view)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Exit", command=self.root.quit)
@@ -1163,6 +1170,11 @@ class ByteDogApp:
         """Toggle always on top"""
         current = self.root.attributes('-topmost')
         self.root.attributes('-topmost', not current)
+
+    def apply_see_through(self) -> None:
+        """Solid by default; the View menu toggle makes the window see-through."""
+        alpha = SEE_THROUGH_ALPHA if self.see_through.get() else 1.0
+        self.root.attributes('-alpha', alpha)
 
     def show_minimal_view(self):
         """Show minimal overlay view"""
