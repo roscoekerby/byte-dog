@@ -58,8 +58,9 @@ before that point.
   the notice's Open ByteDog):
   - Every process, ranked in exactly the order Suspend Top / Kill Top Hog and
     the automatic guardian act (biggest single eligible process first). The
-    highlighted row is the next target; unranked rows say why (protected,
-    browser core, suspended)
+    State column reads "next up" on the highlighted next target and "in line"
+    on the other ranked rows; unranked rows say why they are skipped
+    (protected, browser core, too small, suspended)
   - Suspend / Resume / Kill on any specific row (right-click works too);
     protected processes still need the explicit override dialog
   - Optional "Group by app" view (Chrome x60 -> expand to each process)

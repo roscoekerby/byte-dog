@@ -84,6 +84,8 @@ def test_flat_order_is_rank_order_with_top_highlighted(panel):
     assert 'next' in p.tree.item('p:4', 'tags')
     assert p.tree.set('p:4', 'rank') == '1'
     assert p.tree.set('p:1', 'state') == 'protected'
+    assert p.tree.set('p:4', 'state') == 'next up'
+    assert p.tree.set('p:2', 'state') == 'in line'
     assert 'llama-server.exe' in p.status.cget('text')
 
 

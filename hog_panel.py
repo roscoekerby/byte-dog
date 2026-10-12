@@ -26,9 +26,17 @@ def fmt_mem(rss: int) -> str:
     return f"{gb:.2f} GB" if gb >= 1 else f"{rss / (1024 ** 2):.0f} MB"
 
 
+def row_state(r) -> str:
+    """Ranked rows say where they stand in the queue; the rest say why they're skipped."""
+    if r.suspended:
+        return 'suspended'
+    if r.rank:
+        return 'next up' if r.rank == 1 else 'in line'
+    return r.reason
+
+
 def row_values(r) -> tuple:
-    state = 'suspended' if r.suspended else r.reason
-    return (r.rank or '', fmt_mem(r.rss), state, r.label)
+    return (r.rank or '', fmt_mem(r.rss), row_state(r), r.label)
 
 
 def row_tags(r) -> tuple:
