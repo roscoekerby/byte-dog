@@ -92,6 +92,55 @@ def test_a_short_recovery_does_not_end_the_episode():
     assert engine.state.level == THROTTLED and engine.state.since == 0.0
 
 
+def test_a_sensor_dropout_mid_throttle_is_not_a_recovery():
+    engine = ThermalEngine()
+    run(engine, render_day(30))
+    dropout = [Sample(32.0 + i * 2.0, gpu_temp=84.0) for i in range(15)]
+    assert run(engine, dropout) == []
+    assert engine.state.level == THROTTLED and engine.state.since == 0.0
+
+
+def test_sleep_ends_the_episode_at_the_last_sample_instead_of_counting_the_gap():
+    engine = ThermalEngine()
+    run(engine, render_day(60))
+    events = run(engine, [Sample(60.0 + 8 * 3600, 98.0, 10.0, 40.0)])
+    assert [kind for kind, _ in events] == ['end']
+    assert events[0][1].end == 60.0 and events[0][1].seconds == 60.0
+    assert engine.state.level == OK
+    again = run(engine, [Sample(60.0 + 8 * 3600 + 2, 23.0, 54.0)])
+    assert again == []                       # the hold time starts afresh after the gap
+
+
+def test_flush_closes_an_open_episode_once():
+    engine = ThermalEngine()
+    run(engine, render_day(30))
+    episode = engine.flush()
+    assert episode.start == 0.0 and episode.end == 30.0
+    assert engine.flush() is None and ThermalEngine().flush() is None
+
+
+def test_on_battery_a_slow_clock_is_not_throttling():
+    engine = ThermalEngine()
+    samples = [Sample(i * 2.0, 23.0, 54.0, 50.0, on_battery=True) for i in range(30)]
+    assert run(engine, samples) == [] and engine.state.level == OK
+
+
+def test_a_gpu_only_episode_does_not_report_an_idle_cpu_as_the_slowdown():
+    engine = ThermalEngine()
+    hot = [Sample(i * 2.0, 8.0, 3.0, 90.0, GPU_HW_THERMAL) for i in range(10)]
+    cool = [Sample(20.0 + i * 2.0, 8.0, 3.0, 60.0) for i in range(12)]
+    episode = run(engine, hot + cool)[-1][1]
+    assert episode.min_cpu_speed is None and episode.max_gpu_temp == 90.0
+
+
+def test_warm_is_judged_against_the_gpus_own_slowdown_temperature():
+    engine = ThermalEngine()
+    run(engine, [Sample(i * 2.0, 100, 50, 84.0, gpu_slowdown_c=97.0) for i in range(5)])
+    assert engine.state.level == OK          # 84 C is routine for a GPU that slows at 97 C
+    run(engine, [Sample(20.0, 100, 50, 93.0, gpu_slowdown_c=97.0)])
+    assert engine.state.level == WARM
+
+
 def test_missing_readings_never_alert():
     engine = ThermalEngine()
     assert run(engine, [Sample(i * 2.0) for i in range(30)]) == []
@@ -143,6 +192,7 @@ def test_cooling_comparison_uses_equal_spans_around_the_marker():
     assert before.seconds == 7200 and after.seconds == 600
     assert before.days == after.days == 2
     assert cooling_comparison(episodes, [], 4 * day) is None
+    assert cooling_comparison(episodes, [(2 * day, 'cooling pad')], 2 * day + 300) == ('cooling pad', None, None)
 
 
 def test_durations_read_naturally():
@@ -160,6 +210,11 @@ def test_config_round_trip_and_bad_values(tmp_path):
     assert ThermalConfig.load(path).auto_action == AUTO_OFF
     path.write_text('nonsense', encoding='utf-8')
     assert ThermalConfig.load(path) == ThermalConfig()
+    path.write_text('{"hold_s": -5, "auto_after_s": NaN, "recover_s": "soon", "cpu_busy_min_pct": 50}',
+                    encoding='utf-8')
+    fixed = ThermalConfig.load(path)
+    assert fixed.hold_s == 2.0 and fixed.auto_after_s == 60.0 and fixed.recover_s == 20.0
+    assert fixed.cpu_busy_min_pct == 50.0
 
 
 def test_automatic_relief_is_off_by_default_and_acts_once_per_episode():

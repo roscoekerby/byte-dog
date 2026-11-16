@@ -39,8 +39,10 @@ before that point.
     below normal speed while it is busy (held for 10 s), or the GPU reporting a
     thermal slowdown. This is the cause of a laggy mouse and keyboard during
     long GPU or CPU jobs, even with plenty of free RAM. A slow clock on an idle
-    CPU is power saving and is not flagged
-  - A badge in the minimal and compact views (HOT, or THROTTLED with the % of
+    CPU is power saving and is not flagged, and neither is a slow clock on
+    battery. A power plan that caps the processor on mains power looks the
+    same as heat, so the notice says heat is the usual cause, not the only one
+  - A badge in the minimal and compact views (WARM, or THROTTLED with the % of
     normal speed) and a notice when throttling starts that names the biggest
     heat source
   - "What is making the heat": processes ranked by CPU plus GPU use, with

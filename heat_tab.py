@@ -8,6 +8,7 @@ heat_pause / heat_resume / heat_slow / heat_close actions.
 """
 from __future__ import annotations
 
+import math
 import time
 import tkinter as tk
 from tkinter import simpledialog, ttk
@@ -27,7 +28,7 @@ HISTORY_EVERY_TICKS = 15
 COLUMNS = ('pid', 'cpu', 'gpu', 'state')
 HEADINGS = {'pid': 'PID', 'cpu': 'CPU', 'gpu': 'GPU', 'state': 'State'}
 WIDTHS = {'#0': 240, 'pid': 70, 'cpu': 70, 'gpu': 70, 'state': 110}
-STATUS = {OK: ('Normal', 'success'), WARM: ('Hot', 'warning'), THROTTLED: ('THROTTLED', 'error')}
+STATUS = {OK: ('Normal', 'success'), WARM: ('Warm', 'warning'), THROTTLED: ('THROTTLED', 'error')}
 AUTO_LABELS = {AUTO_OFF: 'Do nothing', AUTO_SLOW: 'Lower its priority', AUTO_PAUSE: 'Pause it'}
 
 
@@ -62,6 +63,9 @@ def history_lines(episodes: list, markers: list, now: float) -> list:
     compared = cooling_comparison(episodes, markers, now)
     if compared:
         note, before, after = compared
+        if after is None:
+            lines.append(f"Since \"{note}\": the before and after comparison appears after a day")
+            return lines
         lines.append(f"Since \"{note}\": {fmt_duration(after.per_day_s)} a day throttled, "
                      f"against {fmt_duration(before.per_day_s)} a day before")
     return lines
@@ -167,7 +171,9 @@ class HeatTab(tk.Frame):
         cfg.alerts = bool(self.alerts_var.get())
         cfg.auto_action = next((k for k, v in AUTO_LABELS.items() if v == self.auto_var.get()), AUTO_OFF)
         try:
-            cfg.auto_after_s = min(max(float(self.after_var.get()), 10.0), 3600.0)
+            seconds = float(self.after_var.get())
+            if math.isfinite(seconds):
+                cfg.auto_after_s = min(max(seconds, 10.0), 3600.0)
         except ValueError:
             pass
         self.after_var.set(f"{cfg.auto_after_s:.0f}")
@@ -204,7 +210,8 @@ class HeatTab(tk.Frame):
 
     def _show_rows(self) -> None:
         rows = self.watch.heat_rows()
-        paused = set(self.app.guardian.suspended)
+        suspended = dict(self.app.guardian.suspended)     # a copy: other threads change it
+        paused = set(suspended)
         keep = self.tree.selection()
         self.tree.delete(*self.tree.get_children())
         for r in rows:
@@ -212,7 +219,7 @@ class HeatTab(tk.Frame):
             self.tree.insert('', 'end', iid=str(r.pid), text=r.name,
                              values=(r.pid, f"{r.cpu:.1f}%", f"{r.gpu:.0f}%", 'paused' if is_paused else ''),
                              tags=('paused',) if is_paused else ())
-        for pid, name in self.app.guardian.suspended.items():
+        for pid, name in suspended.items():
             if not self.tree.exists(str(pid)):
                 self.tree.insert('', 'end', iid=str(pid), text=name, values=(pid, '', '', 'paused'),
                                  tags=('paused',))
@@ -220,6 +227,7 @@ class HeatTab(tk.Frame):
         self._rows = rows
         if keep and self.tree.exists(keep[0]):
             self.tree.selection_set(keep[0])
+            self.tree.see(keep[0])
 
     def refresh(self) -> None:
         state, sample = self.watch.state, self.watch.last_sample
@@ -237,7 +245,7 @@ class HeatTab(tk.Frame):
             power = f"{sample.gpu_power_w:.0f} W   " if sample.gpu_power_w is not None else ''
             limits = ', '.join(gpu_reason_names(sample.gpu_reasons)) or 'no limits active'
             self.gpu.set(f"{sample.gpu_temp:.0f} °C", f"{power}{limits}")
-        self.chart.set_data([min(v, 100.0) for v in self.watch.speed_history if v is not None])
+        self.chart.set_data([min(v, 100.0) for v in self.watch.speed_points() if v is not None])
         self._show_rows()
         if self._ticks % HISTORY_EVERY_TICKS == 0:
             self._show_history()

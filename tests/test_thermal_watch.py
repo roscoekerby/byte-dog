@@ -49,11 +49,12 @@ class Clock:
         return self.t
 
 
-def make_watch(tmp_path, config=None, cpu=None):
+def make_watch(tmp_path, config=None, cpu=None, self_pid=1):
     clock = Clock()
     watch = ThermalWatch(
         config=config or ThermalConfig(), log=ThermalLog(tmp_path / 'log.jsonl'), cpu_reader=cpu or FakeCpu(),
         sources=FakeSources(), clock=clock, resolve_name=lambda pid, name: f"{name}.exe",
+        on_battery=lambda: False, self_pid=self_pid,
         gpu_thermal=lambda: {'temperature': 84.0, 'reasons': GPU_POWER_CAP, 'power_w': 54.0})
     return watch, clock
 
@@ -115,9 +116,44 @@ def test_a_failing_sensor_reads_as_unknown_not_throttled(tmp_path):
     assert watch.state.level == OK and watch.last_sample.cpu_speed is None
 
 
+def test_bytedog_never_lists_itself_as_a_heat_source(tmp_path):
+    watch, clock = make_watch(tmp_path, self_pid=10)
+    step(watch, clock, 8)
+    assert [r.pid for r in watch.heat_rows()] == [12, 11]
+
+
+def test_the_logged_cause_is_who_started_it_not_who_is_left_after_a_pause(tmp_path):
+    cpu = FakeCpu()
+    watch, clock = make_watch(tmp_path, cpu=cpu)
+    step(watch, clock, 10)
+    watch._sources.read = lambda: ({12: 'chrome'}, {12: 5.6}, {})      # python was paused
+    cpu.speed, cpu.busy = 98.0, 12.0
+    watch._gpu_thermal = lambda: {'temperature': 60.0, 'reasons': 0, 'power_w': 5.0}
+    step(watch, clock, 14)
+    assert watch.log.read()[0][0].cause == 'python.exe (GPU)'
+
+
+def test_stopping_mid_throttle_still_logs_the_episode_and_closes_the_counters(tmp_path):
+    watch, clock = make_watch(tmp_path)
+    closed = []
+    watch._cpu.close = lambda: closed.append('cpu')
+    step(watch, clock, 10)
+    watch.stop()
+    episodes, _ = watch.log.read()
+    assert len(episodes) == 1 and episodes[0].cause == 'python.exe (GPU)'
+    assert episodes[0].seconds == 18.0 and closed == ['cpu']
+
+
+def test_on_battery_a_slow_busy_cpu_is_power_saving(tmp_path):
+    watch, clock = make_watch(tmp_path)
+    watch._on_battery = lambda: True
+    watch._gpu_thermal = lambda: {'temperature': 50.0, 'reasons': 0, 'power_w': 5.0}
+    assert step(watch, clock, 20) == [] and watch.state.level == OK
+
+
 def test_badge_text():
     assert badge(ThermalState()) == ('', 'success')
-    assert badge(ThermalState('warm')) == ('HOT', 'warning')
+    assert badge(ThermalState('warm')) == ('WARM', 'warning')
     assert badge(ThermalState(THROTTLED, (), 23.4)) == ('THROTTLED 23%', 'error')
 
 
@@ -167,7 +203,8 @@ def test_wording():
     assert status_text(ThermalState()) == ('Normal', 'No throttling', 'success')
     assert speed_note(Sample(0, 72.0, 10.0), ThermalConfig()) == 'of normal speed   10% busy, so it is saving power'
     assert speed_note(Sample(0, 23.0, 54.0), ThermalConfig()) == 'of normal speed   54% busy'
-    assert headline(throttled) == 'Your PC is being slowed down: CPU at 23% of normal speed'
+    assert headline(throttled).startswith('CPU at 23% of normal speed while busy.')
+    assert headline(ThermalState(THROTTLED, (), None, 90.0, 0.0)) == 'The GPU is too hot and has slowed itself down.'
     assert 'python.exe (PID 10)' in culprit_line([HeatRow(10, 'python.exe', 24.0, 78.0, 102.0)])
     assert culprit_line([]) == 'Finding what is making the heat...'
     episodes = [Episode(0, 7200, 23.0, 84.0, 'python.exe (GPU)')]
@@ -176,6 +213,8 @@ def test_wording():
     assert summary_line('Last 7 days', summarise([], 0, 86400)) == 'Last 7 days: no throttling'
     lines = history_lines(episodes, [(86400.0, 'cooling pad')], 2 * 86400.0)
     assert lines[-1] == 'Since "cooling pad": 0 s a day throttled, against 2 h 00 min a day before'
+    early = history_lines(episodes, [(86400.0, 'cooling pad')], 86400.0 + 600)
+    assert early[-1] == 'Since "cooling pad": the before and after comparison appears after a day'
 
 
 # ── on the real app ─────────────────────────────────────────────────────
@@ -253,6 +292,94 @@ def test_automatic_relief_skips_protected_and_pauses_the_next(heat, monkeypatch)
     assert dog._heat_auto(AUTO_PAUSE, rows) == 'Automatic relief found nothing safe to act on'
 
 
+class FakeProc:
+    """Stands in for psutil.Process: one live process per pid, with a start time."""
+    table = {}
+
+    def __init__(self, pid):
+        if pid not in self.table:
+            import psutil
+            raise psutil.NoSuchProcess(pid)
+        self.pid, self.s = pid, self.table[pid]
+
+    def create_time(self):
+        return self.s['started']
+
+    def nice(self, value=None):
+        if value is None:
+            return self.s['nice']
+        if self.s.get('deny_nice'):
+            import psutil
+            raise psutil.AccessDenied(self.pid)
+        self.s['nice'] = value
+
+    def cpu_affinity(self, cores=None):
+        if cores is None:
+            return list(self.s['cores'])
+        self.s['cores'] = list(cores)
+
+
+@pytest.fixture
+def procs(heat, monkeypatch):
+    import heat_actions
+    dog, _, _ = heat
+    FakeProc.table = {50: {'started': 1.0, 'nice': 32, 'cores': list(range(8))}}
+    monkeypatch.setattr(heat_actions.psutil, 'Process', FakeProc)
+    monkeypatch.setattr(dog, '_is_protected', lambda name, pid: False)
+    monkeypatch.setattr(dog, '_same_process', lambda pid, name: pid in FakeProc.table)
+    return dog, FakeProc.table
+
+
+def test_slow_down_then_resume_restores_cores_and_priority(procs):
+    dog, table = procs
+    row = HeatRow(50, 'render.exe', 60.0, 0.0, 60.0)
+    assert dog.heat_slow(row).startswith('Slowed render.exe: 4 cores')
+    assert table[50]['cores'] == [4, 5, 6, 7] and table[50]['nice'] != 32
+    dog.heat_slow(row)                                   # a second click must not halve it again
+    assert table[50]['cores'] == [4, 5, 6, 7]
+    assert dog.heat_resume(row) == 'render.exe is back to full speed'
+    assert table[50] == {'started': 1.0, 'nice': 32, 'cores': list(range(8))}
+    assert dog._heat_slowed == {}
+
+
+def test_a_reused_pid_never_inherits_another_process_settings(procs):
+    dog, table = procs
+    dog.heat_slow(HeatRow(50, 'render.exe', 60.0, 0.0, 60.0))
+    table[50] = {'started': 2.0, 'nice': 64, 'cores': [0, 1]}        # render.exe exited; PID reused
+    newcomer = HeatRow(50, 'other.exe', 10.0, 0.0, 10.0)
+    assert dog.heat_resume(newcomer) == 'other.exe was not paused or slowed'
+    assert table[50] == {'started': 2.0, 'nice': 64, 'cores': [0, 1]} and dog._heat_slowed == {}
+    dog._heat_slowed[50] = (1.0, 32, list(range(8)))                    # stale record again
+    dog.heat_slow(newcomer)
+    assert table[50]['cores'] == [1] and dog._heat_slowed[50][0] == 2.0 and dog._heat_slowed[50][2] == [0, 1]
+
+
+def test_a_failed_slow_down_is_rolled_back(procs):
+    dog, table = procs
+    table[50]['deny_nice'] = True
+    message = dog.heat_slow(HeatRow(50, 'render.exe', 60.0, 0.0, 60.0))
+    assert message.startswith('Could not slow render.exe')
+    assert table[50]['cores'] == list(range(8))
+
+
+def test_resume_of_a_process_that_has_gone_clears_the_record(procs):
+    dog, table = procs
+    dog.heat_slow(HeatRow(50, 'render.exe', 60.0, 0.0, 60.0))
+    del table[50]
+    assert dog.heat_resume(HeatRow(50, 'render.exe', 0, 0, 0)) == 'render.exe was not paused or slowed'
+    assert dog._heat_slowed == {}
+
+
+def test_automatic_slow_down_moves_on_from_a_process_it_already_slowed(procs):
+    from thermal_model import AUTO_SLOW
+    dog, table = procs
+    table[51] = {'started': 3.0, 'nice': 32, 'cores': list(range(8))}
+    rows = [HeatRow(50, 'render.exe', 60.0, 0.0, 60.0), HeatRow(51, 'encode.exe', 30.0, 0.0, 30.0)]
+    assert 'render.exe' in dog._heat_auto(AUTO_SLOW, rows)
+    assert 'encode.exe' in dog._heat_auto(AUTO_SLOW, rows)
+    assert dog._heat_auto(AUTO_SLOW, rows) == 'Automatic relief found nothing safe to act on'
+
+
 def test_slow_down_refuses_protected_processes(heat, monkeypatch):
     dog, _, _ = heat
     monkeypatch.setattr(dog, '_is_protected', lambda name, pid: True)
@@ -301,6 +428,6 @@ def test_badge_appears_in_the_small_views(heat):
         dog.set_view_mode('compact')
         dog.update_metrics()
         assert dog.heat_compact_label.cget('text') == 'THROTTLED 23%'
-        assert dog.status_label.cget('text') == 'Status: Overheating'
+        assert dog.status_label.cget('text') == 'Status: Throttled'
     finally:
         dog.set_view_mode(before)

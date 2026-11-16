@@ -1716,7 +1716,8 @@ class ByteDogApp(HeatActions):
                     if heat_text and hasattr(self, 'status_canvas'):
                         # "Status: Good" next to THROTTLED would contradict it
                         self.status_canvas.itemconfig(self.status_indicator, fill=self.colors[heat_key])
-                        self.status_label.config(text="Status: Overheating")
+                        self.status_label.config(
+                            text="Status: Throttled" if heat_key == 'error' else "Status: Running warm")
 
             # Update detailed view
             elif self.view_mode.get() == "detailed":

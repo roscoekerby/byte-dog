@@ -781,3 +781,14 @@ stay quiet. The GPU power cap bit is shown but does not count as throttling. Slo
 limits a process to the later half of its cores and lowers its priority; Resume restores
 both. The detailed window grew from 620x700 to 720x770 so nine tabs and the Heat tab fit.
 Today's real readings (23% speed while 54% busy) are the headline test case.
+
+### Review fixes (2026-11-16, code-reviewer findings on fc11c97)
+- [x] Slow down record is tied to the process start time, so a reused PID never inherits or loses settings; failed slow downs roll back; failed restores keep the record
+- [x] UI reads copies of the speed history and the suspended list (the sampler thread changes both)
+- [x] Automatic slow down skips processes it already slowed
+- [x] Sensor dropouts hold the state; a sleep gap ends the episode at the last sample; an episode open at exit is logged
+- [x] GPU-only episodes no longer report an idle CPU as the slowdown; "warm" is judged against the GPU's own slowdown temperature
+- [x] On battery a slow clock is power saving; wording no longer claims heat as the only cause
+- [x] Cooling comparison waits a day; settings file values are range-checked; ByteDog is never listed as a heat source
+- [x] Counter array read retries when the process list grows; NVML's renamed reasons call is tried too
+- Not done: a lasting on-screen marker for automatically paused processes (they show as paused in the Heat tab and the Guardian log); a fallback for Windows without the Process V2 counters

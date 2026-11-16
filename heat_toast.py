@@ -14,8 +14,8 @@ AUTOCLOSE_S = 30
 
 def headline(state) -> str:
     if state.cpu_speed is not None and state.cpu_speed < 100:
-        return f"Your PC is being slowed down: CPU at {state.cpu_speed:.0f}% of normal speed"
-    return "Your PC is being slowed down by heat"
+        return f"CPU at {state.cpu_speed:.0f}% of normal speed while busy. Usually heat; a power plan can do it too."
+    return "The GPU is too hot and has slowed itself down."
 
 
 def culprit_line(rows) -> str:
@@ -39,7 +39,7 @@ def build_heat_toast(app, state, rows, icon_fn) -> tk.Toplevel:
     tk.Frame(toast, bg=c['error'], height=4).pack(fill='x')
     body = tk.Frame(toast, bg=c['bg'])
     body.pack(fill='both', expand=True, padx=12, pady=(8, 4))
-    tk.Label(body, text="\U0001F415 Overheating: throttled", bg=c['bg'], fg=c['error'],
+    tk.Label(body, text="\U0001F415 Throttled: your PC has been slowed down", bg=c['bg'], fg=c['error'],
              font=font(10, 'bold'), anchor='w').pack(fill='x')
     tk.Label(body, text=headline(state), bg=c['bg'], fg=c['fg'], font=font(9), anchor='w',
              justify='left', wraplength=WIDTH - 24).pack(fill='x')

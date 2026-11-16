@@ -97,6 +97,8 @@ def get_gpu_thermal() -> dict | None:
     temp = read('nvmlDeviceGetTemperature', getattr(pynvml, 'NVML_TEMPERATURE_GPU', 0))
     power = read('nvmlDeviceGetPowerUsage')
     reasons = read('nvmlDeviceGetCurrentClocksThrottleReasons')
+    if reasons is None:     # newer drivers renamed it
+        reasons = read('nvmlDeviceGetCurrentClocksEventReasons')
     slowdown = read('nvmlDeviceGetTemperatureThreshold',
                     getattr(pynvml, 'NVML_TEMPERATURE_THRESHOLD_SLOWDOWN', 1))
     return {

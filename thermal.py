@@ -71,15 +71,23 @@ class PdhQuery:
         """instance name -> value for a wildcard counter. Same-named instances are summed."""
         if self._pdh is None or not self.ok[index]:
             return {}
-        size, count = wintypes.DWORD(0), wintypes.DWORD(0)
         fmt = PDH_FMT_DOUBLE | PDH_FMT_NOCAP100
-        status = self._pdh.PdhGetFormattedCounterArrayW(
-            self._counters[index], fmt, ctypes.byref(size), ctypes.byref(count), None)
-        if status != PDH_MORE_DATA or size.value == 0:
-            return {}
-        buffer = (ctypes.c_byte * size.value)()
-        if self._pdh.PdhGetFormattedCounterArrayW(
-                self._counters[index], fmt, ctypes.byref(size), ctypes.byref(count), buffer) != 0:
+        buffer, count = None, wintypes.DWORD(0)
+        for _ in range(3):      # a process starting between the two calls grows the list
+            size = wintypes.DWORD(0)
+            status = self._pdh.PdhGetFormattedCounterArrayW(
+                self._counters[index], fmt, ctypes.byref(size), ctypes.byref(count), None)
+            if status != PDH_MORE_DATA or size.value == 0:
+                return {}
+            size = wintypes.DWORD(size.value + size.value // 8)
+            buffer = (ctypes.c_byte * size.value)()
+            status = self._pdh.PdhGetFormattedCounterArrayW(
+                self._counters[index], fmt, ctypes.byref(size), ctypes.byref(count), buffer)
+            if status == 0:
+                break
+            if status != PDH_MORE_DATA:
+                return {}
+        else:
             return {}
         items = ctypes.cast(buffer, ctypes.POINTER(_Item))
         out: dict = {}

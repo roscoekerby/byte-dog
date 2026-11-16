@@ -15,7 +15,7 @@ import psutil
 
 from heat_toast import build_heat_toast
 from proc_actions import PRIORITIES
-from thermal_model import AUTO_PAUSE, fmt_duration
+from thermal_model import AUTO_PAUSE, AUTO_SLOW, fmt_duration
 
 SLOW_PRIORITY = 'Below normal'
 
@@ -30,14 +30,16 @@ class HeatActions:
     def _heat_setup(self, icon_fn) -> None:
         self.heat_alert_window = None
         self._heat_icon = icon_fn
-        self._heat_slowed = {}       # pid -> (nice, affinity) before Slow down
+        # pid -> (create_time, nice, affinity) from before Slow down. The create
+        # time ties the record to that one process, never to a reused PID.
+        self._heat_slowed = {}
 
     # ── events from the watch ───────────────────────────────────────────
     def handle_heat_event(self, event) -> None:
         kind = event[0]
         if kind == 'start':
             _, state, rows = event
-            self.guardian.log_event('warn', f"Throttled by heat: {'; '.join(state.reasons)}")
+            self.guardian.log_event('warn', f"Throttled: {'; '.join(state.reasons)}")
             if self.thermal.config.alerts:
                 self.show_heat_alert(state, rows)
         elif kind == 'end':
@@ -71,7 +73,7 @@ class HeatActions:
         if ok is None:
             return "Cancelled"
         if not ok:
-            return f"Could not pause {row.name} (it may need ByteDog run as administrator)"
+            return f"Could not pause {row.name} (it may have closed, or need ByteDog run as administrator)"
         return f"Paused {row.name} (PID {row.pid}). Nothing is lost; Resume carries on."
 
     def heat_resume(self, row, parent=None) -> str:
@@ -80,7 +82,9 @@ class HeatActions:
             if not self.resume_pid(row.pid, row.name, parent):
                 return f"Could not resume {row.name}"
             return f"Resumed {row.name} (PID {row.pid})"
-        return f"{row.name} is back to full speed" if restored else f"{row.name} was not paused or slowed"
+        if restored is None:
+            return f"{row.name} was not paused or slowed"
+        return f"{row.name} is back to full speed" if restored else f"Could not restore {row.name}; try Resume again"
 
     def heat_slow(self, row, parent=None) -> str:
         if self._is_protected(row.name, row.pid):
@@ -98,27 +102,45 @@ class HeatActions:
     def _slow(self, pid: int, name: str) -> str:
         try:
             proc = psutil.Process(pid)
-            if pid not in self._heat_slowed:
-                self._heat_slowed[pid] = (proc.nice(), proc.cpu_affinity())
-            cores = slow_cores(self._heat_slowed[pid][1])
+            started = proc.create_time()
+            saved = self._heat_slowed.get(pid)
+            if saved is None or saved[0] != started:
+                saved = (started, proc.nice(), proc.cpu_affinity())
+            cores = slow_cores(saved[2])
+        except (psutil.Error, OSError, ValueError) as e:
+            return f"Could not slow {name}: {e}"
+        try:
             proc.cpu_affinity(cores)
             proc.nice(PRIORITIES[SLOW_PRIORITY])
         except (psutil.Error, OSError, ValueError) as e:
-            self._heat_slowed.pop(pid, None)
+            try:                              # do not leave it half-slowed
+                proc.cpu_affinity(saved[2])
+                proc.nice(saved[1])
+            except (psutil.Error, OSError, ValueError):
+                self._heat_slowed[pid] = saved    # keep the record so Resume can retry
             return f"Could not slow {name}: {e}"
+        self._heat_slowed[pid] = saved
         self.guardian.log_event('action', f"Slowed {name} (PID {pid}) to {len(cores)} cores")
         return f"Slowed {name}: {len(cores)} cores and lower priority. Resume undoes it."
 
-    def _restore_speed(self, pid: int) -> bool:
-        before = self._heat_slowed.pop(pid, None)
-        if before is None:
-            return False
+    def _restore_speed(self, pid: int) -> bool | None:
+        """True restored, False could not (record kept for a retry), None nothing to restore."""
+        saved = self._heat_slowed.get(pid)
+        if saved is None:
+            return None
         try:
             proc = psutil.Process(pid)
-            proc.cpu_affinity(before[1])
-            proc.nice(before[0])
+            if proc.create_time() != saved[0]:    # the PID now belongs to another process
+                del self._heat_slowed[pid]
+                return None
+            proc.cpu_affinity(saved[2])
+            proc.nice(saved[1])
+        except psutil.NoSuchProcess:
+            del self._heat_slowed[pid]
+            return None
         except (psutil.Error, OSError, ValueError):
             return False
+        del self._heat_slowed[pid]
         return True
 
     # ── optional automatic relief ───────────────────────────────────────
@@ -126,6 +148,8 @@ class HeatActions:
         """Act on the biggest heat source that is safe to touch. Never asks, so it
         never overrides protection; everything it does is undone by Resume."""
         skip = set(self.guardian.suspended) | {os.getpid()}
+        if action == AUTO_SLOW:
+            skip |= set(self._heat_slowed)
         for row in rows:
             if row.pid in skip or self._is_protected(row.name, row.pid):
                 continue

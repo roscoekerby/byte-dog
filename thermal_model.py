@@ -9,6 +9,7 @@ clock on an idle CPU is ordinary power saving and is never flagged.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from dataclasses import asdict, dataclass, field, fields
@@ -39,6 +40,16 @@ GPU_REASON_TEXT = (
 #: A process below this heat score is not worth listing.
 MIN_HEAT_SCORE = 1.0
 DAY_S = 86400
+#: Samples further apart than this mean the PC slept or the watch stalled: timers start afresh.
+GAP_S = 30.0
+#: "Hot" starts this far below the temperature at which the GPU slows itself down.
+GPU_WARM_MARGIN_C = 5.0
+#: A cooling change is only compared once this much time has passed since it.
+MIN_COMPARE_S = DAY_S
+_LIMITS = {    # setting -> (lowest, highest) accepted from the settings file
+    'cpu_speed_throttled_pct': (10.0, 95.0), 'cpu_busy_min_pct': (5.0, 95.0), 'hold_s': (2.0, 600.0),
+    'recover_s': (2.0, 600.0), 'gpu_warm_c': (50.0, 110.0), 'auto_after_s': (10.0, 3600.0),
+}
 
 
 @dataclass
@@ -56,13 +67,23 @@ class ThermalConfig:
     def load(cls, path: Path | None = None) -> 'ThermalConfig':
         try:
             raw = json.loads(Path(path or CONFIG_PATH).read_text(encoding='utf-8'))
-            known = {f.name: f.type for f in fields(cls)}
+            known = {f.name for f in fields(cls)}
             config = cls(**{k: v for k, v in raw.items() if k in known})
         except (OSError, ValueError, TypeError):
             return cls()
-        if config.auto_action not in (AUTO_OFF, AUTO_SLOW, AUTO_PAUSE):
-            config.auto_action = AUTO_OFF
-        return config
+        return config.checked()
+
+    def checked(self) -> 'ThermalConfig':
+        """Out-of-range or non-numeric settings fall back to the default, in place."""
+        default = type(self)()
+        for name, (low, high) in _LIMITS.items():
+            value = getattr(self, name)
+            ok = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+            setattr(self, name, min(max(float(value), low), high) if ok else getattr(default, name))
+        if self.auto_action not in (AUTO_OFF, AUTO_SLOW, AUTO_PAUSE):
+            self.auto_action = AUTO_OFF
+        self.alerts = bool(self.alerts)
+        return self
 
     def save(self, path: Path | None = None) -> None:
         path = Path(path or CONFIG_PATH)
@@ -80,6 +101,8 @@ class Sample:
     gpu_temp: float | None = None
     gpu_reasons: int = 0              # NVML throttle reason bits
     gpu_power_w: float | None = None
+    gpu_slowdown_c: float | None = None   # temperature at which the GPU slows itself down
+    on_battery: bool = False          # on battery a slow clock is power saving, not heat
 
 
 @dataclass(frozen=True)
@@ -109,13 +132,24 @@ def gpu_reason_names(mask: int) -> list:
 
 
 def cpu_limited(sample: Sample, config: ThermalConfig) -> bool:
-    if sample.cpu_speed is None or sample.cpu_busy is None:
+    """Slow while busy. Not on battery, where Windows holds the clock down to save power.
+    A power plan that caps the processor on mains power looks the same as heat here."""
+    if sample.cpu_speed is None or sample.cpu_busy is None or sample.on_battery:
         return False
     return sample.cpu_speed <= config.cpu_speed_throttled_pct and sample.cpu_busy >= config.cpu_busy_min_pct
 
 
 def gpu_limited(sample: Sample) -> bool:
     return bool(sample.gpu_reasons & GPU_THERMAL_BITS)
+
+
+def gpu_warm(sample: Sample, config: ThermalConfig) -> bool:
+    if sample.gpu_temp is None:
+        return False
+    limit = config.gpu_warm_c
+    if sample.gpu_slowdown_c:
+        limit = sample.gpu_slowdown_c - GPU_WARM_MARGIN_C
+    return sample.gpu_temp >= limit
 
 
 def _reasons(sample: Sample, config: ThermalConfig) -> tuple:
@@ -138,11 +172,35 @@ class ThermalEngine:
         self._episode_start: float | None = None
         self._min_speed: float | None = None
         self._max_temp: float | None = None
+        self._last_t: float | None = None
+
+    def flush(self) -> Episode | None:
+        """End the episode in progress at the last sample (app closing, or a long gap)."""
+        if self._episode_start is None:
+            return None
+        end = self._clear_since or self._last_t or self._episode_start
+        episode = Episode(self._episode_start, end, self._min_speed, self._max_temp)
+        self._episode_start = self._clear_since = self._limited_since = None
+        self.state = ThermalState()
+        return episode
 
     def update(self, sample: Sample) -> tuple:
         cfg = self.config
-        limited = cpu_limited(sample, cfg) or gpu_limited(sample)
         events = []
+        if self._last_t is not None and sample.t - self._last_t > GAP_S:
+            # the PC slept or the watch stalled: do not count the gap as throttled time
+            ended = self.flush()
+            if ended is not None:
+                events.append(ended)
+            self._limited_since = None
+        cpu_unknown = sample.cpu_speed is None or sample.cpu_busy is None
+        if cpu_unknown and not gpu_limited(sample) and (
+                self._limited_since is not None or self._episode_start is not None):
+            # a sensor dropping out is not the machine recovering: hold the state
+            self._last_t = sample.t
+            return self.state, [('end', e) for e in events]
+        self._last_t = sample.t
+        limited = cpu_limited(sample, cfg) or gpu_limited(sample)
         if limited:
             self._clear_since = None
             if self._limited_since is None:
@@ -163,7 +221,7 @@ class ThermalEngine:
                     self._episode_start = None
                     self._clear_since = None
         if self._episode_start is not None:
-            if sample.cpu_speed is not None and (limited or self._min_speed is None):
+            if cpu_limited(sample, cfg):
                 self._min_speed = sample.cpu_speed if self._min_speed is None else min(self._min_speed, sample.cpu_speed)
             if sample.gpu_temp is not None:
                 self._max_temp = sample.gpu_temp if self._max_temp is None else max(self._max_temp, sample.gpu_temp)
@@ -171,7 +229,7 @@ class ThermalEngine:
         if self._episode_start is not None:
             level = THROTTLED
             reasons = _reasons(sample, cfg) or self.state.reasons
-        elif limited or (sample.gpu_temp is not None and sample.gpu_temp >= cfg.gpu_warm_c):
+        elif limited or gpu_warm(sample, cfg):
             level = WARM
             reasons = _reasons(sample, cfg) or (f"GPU at {sample.gpu_temp:.0f} C",)
         else:
@@ -290,13 +348,14 @@ def summarise(episodes: Iterable[Episode], start: float, end: float) -> Summary:
 
 def cooling_comparison(episodes: list, markers: list, now: float) -> tuple | None:
     """``(note, before, after)`` around the latest cooling-change marker, each a Summary
-    over an equal span (at most 7 days). None without a marker."""
+    over an equal span (at most 7 days). None without a marker. ``before`` and ``after``
+    are None until a day has passed, because a few minutes scaled up to "per day" mislead."""
     if not markers:
         return None
     t, note = max(markers)
     span = min(now - t, 7 * DAY_S)
-    if span <= 0:
-        return None
+    if span < MIN_COMPARE_S:
+        return note, None, None
     return note, summarise(episodes, t - span, t), summarise(episodes, t, t + span)
 
 
