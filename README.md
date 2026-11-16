@@ -34,6 +34,28 @@ before that point.
   performance counters (Task Manager's data source) since NVML hides
   per-process memory under WDDM, with NVML process lists as fallback
 - Process list with kill / suspend / resume
+- **Heat and throttling watch (Heat tab):**
+  - Flags when the machine is being slowed down by heat: the CPU clocked well
+    below normal speed while it is busy (held for 10 s), or the GPU reporting a
+    thermal slowdown. This is the cause of a laggy mouse and keyboard during
+    long GPU or CPU jobs, even with plenty of free RAM. A slow clock on an idle
+    CPU is power saving and is not flagged
+  - A badge in the minimal and compact views (HOT, or THROTTLED with the % of
+    normal speed) and a notice when throttling starts that names the biggest
+    heat source
+  - "What is making the heat": processes ranked by CPU plus GPU use, with
+    Pause (freeze in place, nothing lost), Resume, Slow down (half the cores
+    and a lower priority) and Close. The same protection rules as the Guardian
+    apply
+  - Throttling history for the last 24 hours and 7 days (time throttled, worst
+    slowdown, usual culprit), kept in `%APPDATA%\ByteDog	hermal_log.jsonl`.
+    "Mark cooling change" records a new cooling pad, a fan clean or a repaste
+    and compares throttling per day before and after
+  - Optional automatic relief, off by default: after N seconds throttled,
+    slow down or pause the biggest heat source that is safe to touch
+  - Sensors are Windows performance counters and NVML, read in-process. There
+    is no CPU temperature: on many laptops the thermal zone Windows exposes
+    reads a fixed value, and a true reading needs a kernel driver
 - **RAM Guardian with escalating thrash prevention:**
   - **Warn (default 75% RAM):** a small topmost notice naming the next target,
     with Open ByteDog / Suspend Top / Resume All (auto-closes after 15s unless

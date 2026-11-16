@@ -41,6 +41,9 @@ import ui_theme
 from network_tab import NetworkTab
 from overview_tab import OverviewTab
 from perf_tab import PerformanceTab
+from heat_actions import HeatActions
+from heat_tab import HeatTab
+from thermal_watch import ThermalWatch, badge as heat_badge
 
 # GPU backend: NVML via nvidia-ml-py + PDH per-process VRAM (both in-process,
 # no subprocess — safe under pythonw, no console flashes)
@@ -53,6 +56,7 @@ SEE_THROUGH_ALPHA = 0.9
 SYSTEM_THEME_POLL_MS = 5000
 HISTORY_SAMPLE_MS = 2000      # metrics timer: one CPU/RAM/GPU history point per tick
 COMPACT_SIZE = '340x400'
+DETAILED_SIZE = '720x770'
 LOGICAL_CPUS = psutil.cpu_count() or 1
 
 
@@ -534,7 +538,7 @@ class MinimalView(tk.Toplevel):
             self.after(2000, self.update_data)
 
 
-class ByteDogApp:
+class ByteDogApp(HeatActions):
     """Main ByteDog application"""
 
     def __init__(self):
@@ -547,6 +551,8 @@ class ByteDogApp:
         self.guardian = RAMGuardian()
         self.guardian_queue = queue.Queue()
         self.guardian_alert_window = None
+        self.thermal = ThermalWatch()
+        self._heat_setup(apply_window_icon)
         self.safety = ProtectionChecker(
             user_names=lambda: {n.lower() for n in self.guardian.config.user_protected},
             self_pid=os.getpid(),
@@ -744,6 +750,11 @@ class ByteDogApp:
                                                font=ui_theme.font(9))
         self.guardian_compact_label.pack(side=tk.RIGHT, padx=(5, 0))
 
+        # Heat badge: empty unless the machine is hot or throttled
+        self.heat_compact_label = tk.Label(status_frame, text="", bg=self.colors['bg'],
+                                           fg=self.colors['error'], font=ui_theme.font(9, 'bold'))
+        self.heat_compact_label.pack(side=tk.RIGHT, padx=(5, 0))
+
         # System overview frame
         overview_frame = ttk.Frame(self.compact_frame)
         overview_frame.pack(fill='x', pady=10)
@@ -828,6 +839,13 @@ class ByteDogApp:
         self.guardian_tab_frame = guardian_tab
         self.create_guardian_tab(guardian_tab)
 
+        # Heat tab
+        heat_tab = ttk.Frame(notebook)
+        notebook.add(heat_tab, text='Heat')
+        self.heat_tab_frame = heat_tab
+        self.heat_tab = HeatTab(heat_tab, self, is_active=lambda: self._tab_active(heat_tab))
+        self.heat_tab.pack(fill='both', expand=True)
+
         # Services tab
         services_tab = ttk.Frame(notebook)
         notebook.add(services_tab, text='Services')
@@ -880,6 +898,7 @@ class ByteDogApp:
         tools_menu.add_command(label="Toggle RAM Guardian", command=self._menu_toggle_guardian)
         tools_menu.add_command(label="Resume Suspended Processes", command=self._resume_all_suspended)
         tools_menu.add_command(label="Memory Hog Panel", command=self.open_hog_panel)
+        tools_menu.add_command(label="Heat and Throttling", command=self.open_heat_tab)
         tools_menu.add_command(label="Who Is Locking a File...",
                                command=lambda: self.tools.who_locks_dialog())
         tools_menu.add_separator()
@@ -943,9 +962,9 @@ class ByteDogApp:
             # Detailed mode - all information
             self.root.overrideredirect(False)
             self.detailed_frame.pack(fill='both', expand=True)
-            # 620px (not 450px) so the process Treeview's 6 columns fit without
-            # clipping off-screen — see create_process_list's column widths.
-            self.root.geometry("620x700")
+            # Wide enough for the process Treeview's 6 columns and for all nine
+            # tab labels (Heat was the ninth) without clipping.
+            self.root.geometry(DETAILED_SIZE)
             if hasattr(self, 'detailed_toggle_btn'):
                 self.detailed_toggle_btn.config(text="▲")
             if hasattr(self, 'menubar'):
@@ -1629,15 +1648,24 @@ class ByteDogApp:
                 metrics_text = f"CPU: {cpu:.0f}% | RAM: {mem['percent']:.0f}%"
                 if GPU_AVAILABLE and gpu_info:
                     metrics_text += f" | GPU: {gpu_info['load']:.0f}%"
+                heat_text, heat_key = heat_badge(self.thermal.state)
+                if heat_text:
+                    metrics_text += f" | {heat_text}"
 
-                self.minimal_metrics_label.config(text=metrics_text)
+                self.minimal_metrics_label.config(
+                    text=metrics_text, fg=self.colors[heat_key] if heat_text else self.colors['fg'])
+                if heat_text != getattr(self, '_minimal_heat_text', ''):
+                    self._minimal_heat_text = heat_text
+                    self.root.update_idletasks()
+                    self.root.geometry(f"{self.minimal_frame.winfo_reqwidth()}x"
+                                       f"{self.minimal_frame.winfo_reqheight()}")
 
                 # Update status dot color based on overall system load
                 max_usage = max(cpu, mem['percent'])
                 if GPU_AVAILABLE and gpu_info:
                     max_usage = max(max_usage, gpu_info['load'])
 
-                dot_color = ui_theme.level_color(max_usage)
+                dot_color = self.colors[heat_key] if heat_text else ui_theme.level_color(max_usage)
 
                 self.minimal_dot_canvas.itemconfig(self.minimal_dot, fill=dot_color)
 
@@ -1681,6 +1709,14 @@ class ByteDogApp:
                         g_text = f"Shield: {ram_pct:.0f}/{cfg.warn_pct:.0f}% OK"
                         g_color = self.colors['success']
                     self.guardian_compact_label.config(text=g_text, fg=g_color)
+
+                if hasattr(self, 'heat_compact_label'):
+                    heat_text, heat_key = heat_badge(self.thermal.state)
+                    self.heat_compact_label.config(text=heat_text, fg=self.colors[heat_key])
+                    if heat_text and hasattr(self, 'status_canvas'):
+                        # "Status: Good" next to THROTTLED would contradict it
+                        self.status_canvas.itemconfig(self.status_indicator, fill=self.colors[heat_key])
+                        self.status_label.config(text="Status: Overheating")
 
             # Update detailed view
             elif self.view_mode.get() == "detailed":
@@ -1739,6 +1775,7 @@ class ByteDogApp:
                 time.sleep(self.monitor.update_interval)
 
         threading.Thread(target=fast_loop, daemon=True, name='ByteDogFast').start()
+        self.thermal.start()
 
     def trigger_process_scan(self, callback=None):
         """Run a process memory scan in background. Calls callback(processes) when done."""
@@ -1766,6 +1803,13 @@ class ByteDogApp:
             while True:
                 g_event = self.guardian_queue.get_nowait()
                 self.handle_guardian_event(g_event)
+        except queue.Empty:
+            pass
+
+        # Heat watch: throttle started / ended, automatic relief due
+        try:
+            while True:
+                self.handle_heat_event(self.thermal.events.get_nowait())
         except queue.Empty:
             pass
 
@@ -2944,6 +2988,7 @@ Created with Python and psutil
 
     def on_closing(self):
         """Handle application closing"""
+        self.thermal.stop()
         self.root.quit()
         self.root.destroy()
 

@@ -247,6 +247,10 @@ def apply_ttk(root: tk.Misc) -> None:
                     insertcolor=c['fg'])
     style.configure('TCombobox', fieldbackground=c['surface'], foreground=c['fg'],
                     background=c['button'], arrowcolor=c['muted'])
+    # a read-only combobox otherwise falls back to the system's pale field
+    style.map('TCombobox', fieldbackground=[('readonly', c['surface'])],
+              foreground=[('readonly', c['fg'])], selectbackground=[('readonly', c['surface'])],
+              selectforeground=[('readonly', c['fg'])])
     style.configure('TProgressbar', background=c['accent'], troughcolor=c['button'],
                     bordercolor=c['button'], lightcolor=c['accent'], darkcolor=c['accent'])
     style.configure('Horizontal.TScale', background=c['accent'], troughcolor=c['button'],

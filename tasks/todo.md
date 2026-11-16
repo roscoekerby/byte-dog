@@ -706,3 +706,78 @@ span uses the real 2 s sample timer, chart listeners are released on destroy, ad
 order is stable, there is no averaged spike after the tab was hidden, the physical core
 count may be missing, and the Text caret is themed. Verified with screenshots of all 9
 views in both themes (light captured after a live switch from dark) and 199 tests.
+
+# Heat and throttling watch (plan, 2026-11-16, awaiting Roscoe's go-ahead)
+
+Why: on 2026-11-16 a long GPU render heated the laptop until Windows clocked the CPU down to
+23% of normal speed. Mouse and typing lagged for hours and nothing in ByteDog said why. RAM
+was fine, so the RAM Guardian stayed silent.
+
+## What it does
+- Detects throttling: CPU clocked down while busy, GPU thermal or power slowdown.
+- Says so at once (overlay badge, toast) and names what is making the heat.
+- One click to cool down: pause (suspend), slow down (lower priority) or close the top heat
+  source. Reuses the Guardian's protection rules. Alert-only by default; automatic pause is
+  opt-in.
+- Keeps a throttle log (when, how long, how slow, main cause) so the case for a cooling pad
+  or a repaste rests on numbers, and so a new fan can be judged before and after.
+
+## Data sources (no new dependencies, all in-process)
+- CPU: PDH `\Processor Information(_Total)\% Processor Performance`, `% Processor Utility`,
+  `% Performance Limit`, `Performance Limit Flags` (pdh.dll through ctypes, as gpu.py does).
+  Throttled = performance under 60% while the CPU is over 30% busy, held for 10 s. Low clock
+  speed while idle is normal power saving and must not alert.
+- GPU: NVML temperature, power draw, slowdown temperature threshold, and
+  `nvmlDeviceGetCurrentClocksThrottleReasons` (thermal slowdown and power cap bits).
+- Heat sources: per-process CPU from the existing snapshot plus per-process GPU use from PDH
+  `\GPU Engine(pid_*)\Utilization Percentage`.
+- Not available on this laptop: a real CPU temperature. The ACPI thermal zone reads a fixed
+  28 C. A true reading needs a kernel driver (LibreHardwareMonitor), which is out of scope;
+  the clock-speed counters are the reliable signal.
+
+## Phase 1: detection core (pure logic, tested first)
+- [ ] `thermal.py`: PDH reader for the CPU counters; NVML throttle reasons, power and
+      thresholds added to `gpu.py`
+- [ ] `thermal_model.py`: `ThermalState` (ok / warm / throttled), hold time and recovery
+      hysteresis, heat-source ranking, episode records
+- [ ] Tests with recorded samples, including today's (busy 54%, performance 23%) and the
+      idle power-saving case that must stay quiet
+
+## Phase 2: awareness
+- [ ] Overlay and compact view: heat badge (normal, warm, THROTTLED with % of normal speed)
+- [ ] Toast on throttle start, naming the top heat source, with Pause / Slow down / Open ByteDog
+- [ ] New "Heat" tab: CPU speed and GPU temperature charts, current limits, ranked heat
+      sources with Pause / Resume / Slow down / Close per row
+
+## Phase 3: history
+- [ ] Throttle log in `%APPDATA%\ByteDog\thermal_log.jsonl`; Heat tab summary (today and
+      7 days: time throttled, worst slowdown, usual culprit)
+- [ ] "Mark cooling change" button to compare before and after a fan or repaste
+
+## Phase 4: optional automatic relief (off by default)
+- [ ] Setting: after N seconds throttled, lower the top heat source's priority, or pause it
+- [ ] Never touches protected processes; every action logged and reversible from the tab
+
+## Verify
+- [ ] Unit tests; Tk smoke tests for the tab and badge in both themes
+- [ ] Live test: resume the paused TMGP render and confirm ByteDog flags the throttle, names
+      python/ffmpeg, and that Pause from the toast restores CPU speed
+
+## Heat and throttling watch: built 2026-11-16 (Roscoe said go; Phase 4 included, off by default)
+- [x] Phase 1: `thermal_model.py` (engine, heat ranking, log, summaries), `thermal.py` (PDH readers), `gpu.get_gpu_thermal`
+- [x] Phase 2: badge in minimal and compact views, `heat_toast.py`, `heat_tab.py`, `heat_actions.py`
+- [x] Phase 3: `thermal_log.jsonl`, 24 hour and 7 day summaries, "Mark cooling change" comparison
+- [x] Phase 4: automatic slow down or pause after N seconds, off by default, never touches protected processes
+- [x] 36 new tests (241 pass); live sensors checked from source; screenshots of the tab, notice and both badges
+- [ ] Rebuild and restart the installed ByteDog.exe (needs Roscoe's UAC click)
+- [ ] Live test against the paused TMGP render once Roscoe resumes it
+
+### Review
+The watch samples every 2 s on its own thread: CPU clock speed and busy time from PDH, GPU
+temperature, power and throttle reasons from NVML. Per-process counters (Process V2 and GPU
+Engine wildcards) are read only while warm, throttled or with the Heat tab open. Throttled
+needs slow-and-busy for 10 s and ends after 20 s clear, so idle power saving and brief dips
+stay quiet. The GPU power cap bit is shown but does not count as throttling. Slow down
+limits a process to the later half of its cores and lowers its priority; Resume restores
+both. The detailed window grew from 620x700 to 720x770 so nine tabs and the Heat tab fit.
+Today's real readings (23% speed while 54% busy) are the headline test case.

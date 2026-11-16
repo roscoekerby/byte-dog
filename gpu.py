@@ -80,6 +80,33 @@ def get_gpu_info() -> dict | None:
         return None
 
 
+def get_gpu_thermal() -> dict | None:
+    """Temperature, power draw and why the GPU's clocks are being held back
+    (NVML throttle reason bits; see thermal_model.GPU_REASON_TEXT). Any field
+    the driver does not report is None (reasons: 0)."""
+    handle = _nvml_handle()
+    if handle is None:
+        return None
+
+    def read(getter, *args):
+        try:
+            return getattr(pynvml, getter)(handle, *args)
+        except Exception:
+            return None
+
+    temp = read('nvmlDeviceGetTemperature', getattr(pynvml, 'NVML_TEMPERATURE_GPU', 0))
+    power = read('nvmlDeviceGetPowerUsage')
+    reasons = read('nvmlDeviceGetCurrentClocksThrottleReasons')
+    slowdown = read('nvmlDeviceGetTemperatureThreshold',
+                    getattr(pynvml, 'NVML_TEMPERATURE_THRESHOLD_SLOWDOWN', 1))
+    return {
+        'temperature': float(temp) if temp is not None else None,
+        'power_w': power / 1000.0 if power is not None else None,
+        'reasons': int(reasons or 0),
+        'slowdown_c': float(slowdown) if slowdown else None,
+    }
+
+
 def get_process_vram() -> dict[int, float]:
     """Dedicated VRAM per pid, in MB."""
     if platform.system() == 'Windows':
