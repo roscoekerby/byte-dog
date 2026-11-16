@@ -29,7 +29,7 @@ GPU_HW_SLOWDOWN = 0x8
 GPU_SW_THERMAL = 0x20
 GPU_HW_THERMAL = 0x40
 GPU_POWER_BRAKE = 0x80
-GPU_THERMAL_BITS = GPU_HW_SLOWDOWN | GPU_SW_THERMAL | GPU_HW_THERMAL
+GPU_THERMAL_BITS = GPU_SW_THERMAL | GPU_HW_THERMAL
 GPU_REASON_TEXT = (
     (GPU_HW_THERMAL, 'GPU too hot (hardware slowdown)'),
     (GPU_SW_THERMAL, 'GPU too hot (driver slowdown)'),
@@ -40,6 +40,11 @@ GPU_REASON_TEXT = (
 #: A process below this heat score is not worth listing.
 MIN_HEAT_SCORE = 1.0
 DAY_S = 86400
+#: A slowdown on a GPU busier than this can be felt. On an idle GPU it changes nothing.
+GPU_BUSY_MIN_PCT = 20.0
+#: The plain "hardware slowdown" flag is also raised when a laptop's shared power budget goes
+#: to a busy CPU, so on its own it only counts this close to the GPU's slowdown temperature.
+GPU_HW_SLOWDOWN_NEAR_C = 10.0
 #: Samples further apart than this mean the PC slept or the watch stalled: timers start afresh.
 GAP_S = 30.0
 #: "Hot" starts this far below the temperature at which the GPU slows itself down.
@@ -102,6 +107,7 @@ class Sample:
     gpu_reasons: int = 0              # NVML throttle reason bits
     gpu_power_w: float | None = None
     gpu_slowdown_c: float | None = None   # temperature at which the GPU slows itself down
+    gpu_load: float | None = None     # % of the time the GPU is working
     on_battery: bool = False          # on battery a slow clock is power saving, not heat
 
 
@@ -112,6 +118,7 @@ class ThermalState:
     cpu_speed: float | None = None
     gpu_temp: float | None = None
     since: float | None = None        # when the current throttle began
+    limited_now: bool = False         # False while a throttle episode is winding down
 
 
 @dataclass(frozen=True)
@@ -139,8 +146,21 @@ def cpu_limited(sample: Sample, config: ThermalConfig) -> bool:
     return sample.cpu_speed <= config.cpu_speed_throttled_pct and sample.cpu_busy >= config.cpu_busy_min_pct
 
 
+def _gpu_slowdown_bits(sample: Sample) -> int:
+    """The slowdown flags that mean heat. A flag on an idle GPU is not counted: on laptops the
+    GPU raises "hardware slowdown" when the shared power budget goes to a busy CPU."""
+    if sample.gpu_load is not None and sample.gpu_load < GPU_BUSY_MIN_PCT:
+        return 0
+    bits = sample.gpu_reasons & GPU_THERMAL_BITS
+    if sample.gpu_reasons & GPU_HW_SLOWDOWN and sample.gpu_temp is not None:
+        limit = sample.gpu_slowdown_c - GPU_HW_SLOWDOWN_NEAR_C if sample.gpu_slowdown_c else 80.0
+        if sample.gpu_temp >= limit:
+            bits |= GPU_HW_SLOWDOWN
+    return bits
+
+
 def gpu_limited(sample: Sample) -> bool:
-    return bool(sample.gpu_reasons & GPU_THERMAL_BITS)
+    return bool(_gpu_slowdown_bits(sample))
 
 
 def gpu_warm(sample: Sample, config: ThermalConfig) -> bool:
@@ -156,7 +176,7 @@ def _reasons(sample: Sample, config: ThermalConfig) -> tuple:
     found = []
     if cpu_limited(sample, config):
         found.append(f"CPU slowed to {sample.cpu_speed:.0f}% of normal speed while {sample.cpu_busy:.0f}% busy")
-    found += [text for bit, text in GPU_REASON_TEXT if sample.gpu_reasons & bit & GPU_THERMAL_BITS]
+    found += [text for bit, text in GPU_REASON_TEXT if _gpu_slowdown_bits(sample) & bit]
     return tuple(found)
 
 
@@ -234,7 +254,7 @@ class ThermalEngine:
             reasons = _reasons(sample, cfg) or (f"GPU at {sample.gpu_temp:.0f} C",)
         else:
             level, reasons = OK, ()
-        self.state = ThermalState(level, reasons, sample.cpu_speed, sample.gpu_temp, self._episode_start)
+        self.state = ThermalState(level, reasons, sample.cpu_speed, sample.gpu_temp, self._episode_start, limited)
         out = []
         for event in events:
             out.append(('start', self.state) if event == 'start' else ('end', event))

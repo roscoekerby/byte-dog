@@ -792,3 +792,9 @@ Today's real readings (23% speed while 54% busy) are the headline test case.
 - [x] Cooling comparison waits a day; settings file values are range-checked; ByteDog is never listed as a heat source
 - [x] Counter array read retries when the process list grows; NVML's renamed reasons call is tried too
 - Not done: a lasting on-screen marker for automatically paused processes (they show as paused in the Heat tab and the Guardian log); a fallback for Windows without the Process V2 counters
+
+### False alarms fixed (2026-11-17)
+- [x] GPU slowdown counts only on a busy GPU, and hardware slowdown only near the slowdown temperature (12 false spells on 16 Nov)
+- [x] Badge shows RECOVERING (not THROTTLED with a normal-looking %) while an episode winds down; THROTTLED (GPU) when the GPU is the cause
+- [ ] Rebuild and restart ByteDog.exe
+- [ ] Clear the false spells from `thermal_log.jsonl` (needs Roscoe's OK: it deletes records)

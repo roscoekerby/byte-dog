@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from thermal_model import (
-    AUTO_OFF, AUTO_PAUSE, GPU_HW_THERMAL, GPU_POWER_CAP, OK, THROTTLED, WARM, AutoRelief, Episode,
+    AUTO_OFF, AUTO_PAUSE, GPU_HW_SLOWDOWN, GPU_HW_THERMAL, GPU_POWER_CAP, OK, THROTTLED, WARM, AutoRelief, Episode,
     HeatRow, Sample, ThermalConfig, ThermalEngine, ThermalLog, ThermalState, cooling_comparison,
     describe_cause, fmt_duration, gpu_reason_names, rank_heat, summarise,
 )
@@ -62,6 +62,42 @@ def test_power_cap_alone_is_not_throttling_but_thermal_slowdown_is():
     hot = [Sample(100 + i * 2.0, 100, 50, 88, GPU_HW_THERMAL) for i in range(8)]
     assert [k for k, _ in run(engine, hot)] == ['start']
     assert 'GPU too hot (hardware slowdown)' in engine.state.reasons
+
+
+def test_an_idle_gpu_flagging_slowdown_while_the_cpu_is_busy_is_not_throttling():
+    """The 16 Nov false alarms: GPU idle at 54 C raising "hardware slowdown" for up to 93 minutes
+    while antivirus and svchost kept the CPU busy at full speed."""
+    engine = ThermalEngine()
+    samples = [Sample(i * 2.0, 100.0, 60.0, 54.0, GPU_HW_SLOWDOWN | 0x1, gpu_slowdown_c=91.0, gpu_load=0.0)
+               for i in range(1800)]
+    assert run(engine, samples) == [] and engine.state.level == OK
+
+
+def test_hardware_slowdown_on_a_busy_gpu_counts_only_near_its_slowdown_temperature():
+    engine = ThermalEngine()
+    cool = [Sample(i * 2.0, 100.0, 30.0, 70.0, GPU_HW_SLOWDOWN, gpu_slowdown_c=91.0, gpu_load=95.0)
+            for i in range(20)]
+    assert run(engine, cool) == []
+    hot = [Sample(100 + i * 2.0, 100.0, 30.0, 85.0, GPU_HW_SLOWDOWN, gpu_slowdown_c=91.0, gpu_load=95.0)
+           for i in range(8)]
+    assert [k for k, _ in run(engine, hot)] == ['start']
+    assert engine.state.reasons == ('GPU hardware slowdown',)
+
+
+def test_a_heat_flag_on_an_idle_gpu_is_ignored_but_counts_when_busy():
+    engine = ThermalEngine()
+    idle = [Sample(i * 2.0, 100.0, 30.0, 88.0, GPU_HW_THERMAL, gpu_load=3.0) for i in range(20)]
+    assert run(engine, idle) == []
+    busy = [Sample(100 + i * 2.0, 100.0, 30.0, 88.0, GPU_HW_THERMAL, gpu_load=80.0) for i in range(8)]
+    assert [k for k, _ in run(engine, busy)] == ['start']
+
+
+def test_the_state_says_when_an_episode_is_only_winding_down():
+    engine = ThermalEngine()
+    run(engine, render_day(30))
+    assert engine.state.limited_now is True
+    run(engine, [Sample(32.0, 86.0, 20.0, 60.0)])
+    assert engine.state.level == THROTTLED and engine.state.limited_now is False
 
 
 def test_a_hot_gpu_without_slowdown_is_only_warm():

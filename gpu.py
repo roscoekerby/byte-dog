@@ -99,6 +99,7 @@ def get_gpu_thermal() -> dict | None:
     reasons = read('nvmlDeviceGetCurrentClocksThrottleReasons')
     if reasons is None:     # newer drivers renamed it
         reasons = read('nvmlDeviceGetCurrentClocksEventReasons')
+    util = read('nvmlDeviceGetUtilizationRates')
     slowdown = read('nvmlDeviceGetTemperatureThreshold',
                     getattr(pynvml, 'NVML_TEMPERATURE_THRESHOLD_SLOWDOWN', 1))
     return {
@@ -106,6 +107,7 @@ def get_gpu_thermal() -> dict | None:
         'power_w': power / 1000.0 if power is not None else None,
         'reasons': int(reasons or 0),
         'slowdown_c': float(slowdown) if slowdown else None,
+        'load': float(util.gpu) if util is not None else None,
     }
 
 

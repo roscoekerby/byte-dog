@@ -154,7 +154,12 @@ def test_on_battery_a_slow_busy_cpu_is_power_saving(tmp_path):
 def test_badge_text():
     assert badge(ThermalState()) == ('', 'success')
     assert badge(ThermalState('warm')) == ('WARM', 'warning')
-    assert badge(ThermalState(THROTTLED, (), 23.4)) == ('THROTTLED 23%', 'error')
+    cpu = ('CPU slowed to 23% of normal speed while 54% busy',)
+    assert badge(ThermalState(THROTTLED, cpu, 23.4, limited_now=True)) == ('THROTTLED 23%', 'error')
+    assert badge(ThermalState(THROTTLED, ('GPU too hot (hardware slowdown)',), 98.0, 90.0, 0.0, True)) == \
+        ('THROTTLED (GPU)', 'error')
+    # what Roscoe saw: the render paused, CPU back at 86%, episode not yet over
+    assert badge(ThermalState(THROTTLED, cpu, 86.0, 60.0, 0.0, False)) == ('RECOVERING', 'warning')
 
 
 def test_counter_instances_parse_to_pids():
@@ -183,11 +188,13 @@ def test_gpu_thermal_reads_reasons_and_power(monkeypatch):
     fake = SimpleNamespace(
         NVML_TEMPERATURE_GPU=0, nvmlInit=lambda: None, nvmlDeviceGetHandleByIndex=lambda i: object(),
         nvmlDeviceGetTemperature=lambda h, s: 84, nvmlDeviceGetPowerUsage=lambda h: 54050,
-        nvmlDeviceGetCurrentClocksThrottleReasons=lambda h: 4, nvmlDeviceGetTemperatureThreshold=no_threshold)
+        nvmlDeviceGetCurrentClocksThrottleReasons=lambda h: 4, nvmlDeviceGetTemperatureThreshold=no_threshold,
+        nvmlDeviceGetUtilizationRates=lambda h: SimpleNamespace(gpu=63, memory=0))
     monkeypatch.setattr(gpu, 'pynvml', fake)
     monkeypatch.setattr(gpu, '_initialized', False)
     monkeypatch.setattr(gpu, '_init_failed', False)
-    assert gpu.get_gpu_thermal() == {'temperature': 84.0, 'power_w': 54.05, 'reasons': 4, 'slowdown_c': None}
+    assert gpu.get_gpu_thermal() == {'temperature': 84.0, 'power_w': 54.05, 'reasons': 4, 'slowdown_c': None,
+                                     'load': 63.0}
     monkeypatch.setattr(gpu, 'pynvml', None)
     assert gpu.get_gpu_thermal() is None
 
@@ -198,7 +205,8 @@ def test_slow_down_keeps_the_later_half_of_the_cores():
 
 
 def test_wording():
-    throttled = ThermalState(THROTTLED, ('CPU slowed to 23% of normal speed while 54% busy',), 23.0, 84.0, 0.0)
+    throttled = ThermalState(THROTTLED, ('CPU slowed to 23% of normal speed while 54% busy',), 23.0, 84.0, 0.0, True)
+    assert status_text(ThermalState(THROTTLED, (), 86.0, 60.0, 0.0, False))[0] == 'Recovering'
     assert status_text(throttled) == ('THROTTLED', 'CPU slowed to 23% of normal speed while 54% busy', 'error')
     assert status_text(ThermalState()) == ('Normal', 'No throttling', 'success')
     assert speed_note(Sample(0, 72.0, 10.0), ThermalConfig()) == 'of normal speed   10% busy, so it is saving power'

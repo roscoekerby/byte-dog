@@ -42,3 +42,19 @@ the UAC prompt was cancelled. The build failed, and the launch started a second
 **Rule:** gate each step of kill/build/launch on the previous one succeeding
 (`-ErrorAction Stop` / check `$?`). Never launch the app while an old instance is still
 running.
+
+## 2026-11-17: an idle laptop GPU raises "hardware slowdown" when the CPU is busy
+
+**Symptom:** the first build of the heat watch logged 12 "throttled" spells (up to 93 minutes) on
+16 Nov while the GPU sat idle at 53 to 57 C and the CPU ran at full speed. Every spell named a
+CPU-side process (antivirus, svchost). The one real throttle (CPU at 31%, GPU at 87 C, python.exe)
+was caught correctly.
+
+**Cause:** NVML's `HW_SLOWDOWN` bit (0x8) was counted as heat. On laptops the CPU and GPU share a
+power budget, and the GPU raises that flag when the budget goes to a busy CPU, even with nothing
+running on the GPU. A slowdown on an idle GPU also cannot be felt.
+
+**Rule:** a GPU slowdown flag only counts when the GPU is busy (over 20%), and plain hardware
+slowdown only near the card's own slowdown temperature. Before trusting any new detector, run it
+for a few hours of normal use and read its log: a test suite built from the expected case did not
+show this.

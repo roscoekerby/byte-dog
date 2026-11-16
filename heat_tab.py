@@ -37,6 +37,8 @@ def status_text(state) -> tuple:
     label, colour = STATUS.get(state.level, STATUS[OK])
     if state.level == OK:
         return label, 'No throttling', colour
+    if state.level == THROTTLED and not state.limited_now:
+        return 'Recovering', 'Back to normal speed; checking it stays there', 'warning'
     return label, '; '.join(state.reasons) or 'Heat is building up', colour
 
 

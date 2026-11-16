@@ -89,7 +89,7 @@ class ThermalWatch:
         speed, busy = self._cpu.read()
         g = self._gpu_thermal() or {}
         return Sample(now, speed, busy, g.get('temperature'), g.get('reasons') or 0, g.get('power_w'),
-                      g.get('slowdown_c'), self._on_battery())
+                      g.get('slowdown_c'), g.get('load'), self._on_battery())
 
     def _read_rows(self, now: float) -> None:
         if self._sources is None:
@@ -188,8 +188,12 @@ class ThermalWatch:
 def badge(state: ThermalState) -> tuple:
     """``(text, theme colour key)`` for the small views. Empty text while all is well."""
     if state.level == 'throttled':
-        speed = f" {state.cpu_speed:.0f}%" if state.cpu_speed is not None else ''
-        return f"THROTTLED{speed}", 'error'
+        if not state.limited_now:
+            return 'RECOVERING', 'warning'
+        cpu_slow = any(r.startswith('CPU slowed') for r in state.reasons)
+        if cpu_slow and state.cpu_speed is not None:
+            return f"THROTTLED {state.cpu_speed:.0f}%", 'error'
+        return 'THROTTLED (GPU)', 'error'
     if state.level == 'warm':
         return 'WARM', 'warning'
     return '', 'success'
