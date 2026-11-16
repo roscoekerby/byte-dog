@@ -48,7 +48,7 @@ before that point.
     and a lower priority) and Close. The same protection rules as the Guardian
     apply
   - Throttling history for the last 24 hours and 7 days (time throttled, worst
-    slowdown, usual culprit), kept in `%APPDATA%\ByteDog	hermal_log.jsonl`.
+    slowdown, usual culprit), kept in `%APPDATA%\ByteDog\thermal_log.jsonl`.
     "Mark cooling change" records a new cooling pad, a fan clean or a repaste
     and compares throttling per day before and after
   - Optional automatic relief, off by default: after N seconds throttled,
